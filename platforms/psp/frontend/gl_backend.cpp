@@ -1,0 +1,3265 @@
+// OpenGL 3.3 drawing for the GE. See gl_backend.hpp and docs/05-runtime-hle.md §6.
+//
+// Model: every framebuffer address the game draws to gets a render target (color texture + depth buffer) at
+// `scale` times the PSP resolution. Primitives arrive in screen space from the Ge; consecutive ones with the same
+// draw state are batched into one draw call. Textures are decoded once and cached by content hash; a texture that
+// lives inside a render target is sampled from that target directly (render-to-texture effects). Block transfers out
+// of a render target are done on the GPU. The displayed framebuffer is drawn to the window, letterboxed, when the
+// game flips; one the GE has not drawn (CPU-made screens, movies) is uploaded from guest memory instead.
+
+#include "gl_backend.hpp"
+#include "frame_matching.hpp"
+#include "texture_images.hpp"
+#include "texture_pack.hpp"
+
+#include "ge.hpp"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_opengl.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <future>
+#include <set>
+#include <span>
+#include <thread>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <unordered_map>
+#include <string>
+#include <vector>
+
+namespace mhf::psp {
+
+namespace {
+
+// GE registers used here (see platforms/psp/gpu/ge.cpp).
+enum Reg : std::uint32_t {
+    kVertexType = 0x12, kTextureMapEnable = 0x1E, kFogEnable = 0x1F, kAlphaBlendEnable = 0x21,
+    kAlphaTestEnable = 0x22, kZTestEnable = 0x23, kStencilTestEnable = 0x24, kShadeMode = 0x50,
+    kFramebufPtr = 0x9C, kFramebufWidth = 0x9D, kTexAddr0 = 0xA0, kTexBufWidth0 = 0xA8, kClutAddr = 0xB0,
+    kClutAddrUpper = 0xB1, kTexSize0 = 0xB8, kTexMode = 0xC2, kTexFormat = 0xC3, kClutFormat = 0xC5,
+    kTexFilter = 0xC6, kTexWrap = 0xC7, kTexFunc = 0xC9, kTexEnvColor = 0xCA, kFogColor = 0xCF,
+    kFramebufPixFormat = 0xD2, kClearMode = 0xD3, kScissor1 = 0xD4, kScissor2 = 0xD5, kMinZ = 0xD6, kMaxZ = 0xD7,
+    kAlphaTest = 0xDB, kZTest = 0xDE, kBlendMode = 0xDF, kBlendFixedA = 0xE0, kBlendFixedB = 0xE1,
+    kZWriteDisable = 0xE7, kMaskRgb = 0xE8, kMaskAlpha = 0xE9, kViewportXScale = 0x42, kViewportYScale = 0x43,
+    kViewportZScale = 0x44, kViewportXCenter = 0x45, kViewportYCenter = 0x46, kViewportZCenter = 0x47, kOffsetX = 0x4C,
+    kOffsetY = 0x4D,
+};
+
+// Registers whose value changes how a primitive is drawn (anything else only affects vertex processing).
+constexpr std::array<std::uint32_t, 36> kStateRegs = {
+    kVertexType, kTextureMapEnable, kFogEnable, kAlphaBlendEnable, kAlphaTestEnable, kZTestEnable,
+    kStencilTestEnable, kShadeMode, kFramebufPtr, kFramebufWidth, kTexAddr0, kTexBufWidth0, kClutAddr,
+    kClutAddrUpper, kTexSize0, kTexMode, kTexFormat, kClutFormat, kTexFilter, kTexWrap, kTexFunc, kTexEnvColor,
+    kFogColor, kFramebufPixFormat, kClearMode, kScissor1, kScissor2, kMinZ, kMaxZ, kAlphaTest, kZTest, kBlendMode,
+    kBlendFixedA, kBlendFixedB, kZWriteDisable, kMaskRgb,
+};
+
+// OpenGL 1.x entry points (not every platform header declares pointer types for them).
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+using MhfGetString = const GLubyte *(APIENTRY *)(GLenum);
+using MhfGetError = GLenum(APIENTRY *)();
+using MhfViewport = void(APIENTRY *)(GLint, GLint, GLsizei, GLsizei);
+using MhfScissor = void(APIENTRY *)(GLint, GLint, GLsizei, GLsizei);
+using MhfEnable = void(APIENTRY *)(GLenum);
+using MhfDisable = void(APIENTRY *)(GLenum);
+using MhfClear = void(APIENTRY *)(GLbitfield);
+using MhfClearColor = void(APIENTRY *)(GLfloat, GLfloat, GLfloat, GLfloat);
+using MhfColorMask = void(APIENTRY *)(GLboolean, GLboolean, GLboolean, GLboolean);
+using MhfDepthMask = void(APIENTRY *)(GLboolean);
+using MhfDepthFunc = void(APIENTRY *)(GLenum);
+using MhfGenTextures = void(APIENTRY *)(GLsizei, GLuint *);
+using MhfDeleteTextures = void(APIENTRY *)(GLsizei, const GLuint *);
+using MhfBindTexture = void(APIENTRY *)(GLenum, GLuint);
+using MhfTexImage2D = void(APIENTRY *)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+using MhfTexSubImage2D = void(APIENTRY *)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
+using MhfTexParameteri = void(APIENTRY *)(GLenum, GLenum, GLint);
+using MhfPixelStorei = void(APIENTRY *)(GLenum, GLint);
+using MhfDrawArrays = void(APIENTRY *)(GLenum, GLint, GLsizei);
+using MhfReadPixels = void(APIENTRY *)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+
+// ---------------------------------------------------------------- OpenGL entry points
+
+#define MHF_GL_FUNCTIONS(X)                                                                                        \
+    X(MhfGetString, GetString, glGetString)                                                                  \
+    X(MhfGetError, GetError, glGetError)                                                                     \
+    X(MhfViewport, Viewport, glViewport)                                                                     \
+    X(MhfScissor, Scissor, glScissor)                                                                        \
+    X(MhfEnable, Enable, glEnable)                                                                           \
+    X(MhfDisable, Disable, glDisable)                                                                        \
+    X(MhfClear, Clear, glClear)                                                                              \
+    X(MhfClearColor, ClearColor, glClearColor)                                                               \
+    X(MhfColorMask, ColorMask, glColorMask)                                                                  \
+    X(MhfDepthMask, DepthMask, glDepthMask)                                                                  \
+    X(MhfDepthFunc, DepthFunc, glDepthFunc)                                                                  \
+    X(PFNGLBLENDFUNCSEPARATEPROC, BlendFuncSeparate, glBlendFuncSeparate)                                          \
+    X(PFNGLBLENDEQUATIONSEPARATEPROC, BlendEquationSeparate, glBlendEquationSeparate)                              \
+    X(PFNGLBLENDCOLORPROC, BlendColor, glBlendColor)                                                               \
+    X(MhfGenTextures, GenTextures, glGenTextures)                                                            \
+    X(MhfDeleteTextures, DeleteTextures, glDeleteTextures)                                                   \
+    X(MhfBindTexture, BindTexture, glBindTexture)                                                            \
+    X(MhfTexImage2D, TexImage2D, glTexImage2D)                                                               \
+    X(MhfTexSubImage2D, TexSubImage2D, glTexSubImage2D)                                                      \
+    X(MhfTexParameteri, TexParameteri, glTexParameteri)                                                      \
+    X(PFNGLACTIVETEXTUREPROC, ActiveTexture, glActiveTexture)                                                      \
+    X(MhfPixelStorei, PixelStorei, glPixelStorei)                                                            \
+    X(PFNGLGENERATEMIPMAPPROC, GenerateMipmap, glGenerateMipmap)                                                   \
+    X(PFNGLGENFRAMEBUFFERSPROC, GenFramebuffers, glGenFramebuffers)                                                \
+    X(PFNGLDELETEFRAMEBUFFERSPROC, DeleteFramebuffers, glDeleteFramebuffers)                                       \
+    X(PFNGLBINDFRAMEBUFFERPROC, BindFramebuffer, glBindFramebuffer)                                                \
+    X(PFNGLFRAMEBUFFERTEXTURE2DPROC, FramebufferTexture2D, glFramebufferTexture2D)                                 \
+    X(PFNGLFRAMEBUFFERRENDERBUFFERPROC, FramebufferRenderbuffer, glFramebufferRenderbuffer)                        \
+    X(PFNGLCHECKFRAMEBUFFERSTATUSPROC, CheckFramebufferStatus, glCheckFramebufferStatus)                           \
+    X(PFNGLGENRENDERBUFFERSPROC, GenRenderbuffers, glGenRenderbuffers)                                             \
+    X(PFNGLDELETERENDERBUFFERSPROC, DeleteRenderbuffers, glDeleteRenderbuffers)                                    \
+    X(PFNGLBINDRENDERBUFFERPROC, BindRenderbuffer, glBindRenderbuffer)                                             \
+    X(PFNGLRENDERBUFFERSTORAGEPROC, RenderbufferStorage, glRenderbufferStorage)                                    \
+    X(PFNGLBLITFRAMEBUFFERPROC, BlitFramebuffer, glBlitFramebuffer)                                                \
+    X(PFNGLCREATESHADERPROC, CreateShader, glCreateShader)                                                         \
+    X(PFNGLSHADERSOURCEPROC, ShaderSource, glShaderSource)                                                         \
+    X(PFNGLCOMPILESHADERPROC, CompileShader, glCompileShader)                                                      \
+    X(PFNGLGETSHADERIVPROC, GetShaderiv, glGetShaderiv)                                                            \
+    X(PFNGLGETSHADERINFOLOGPROC, GetShaderInfoLog, glGetShaderInfoLog)                                             \
+    X(PFNGLCREATEPROGRAMPROC, CreateProgram, glCreateProgram)                                                      \
+    X(PFNGLATTACHSHADERPROC, AttachShader, glAttachShader)                                                         \
+    X(PFNGLLINKPROGRAMPROC, LinkProgram, glLinkProgram)                                                            \
+    X(PFNGLGETPROGRAMIVPROC, GetProgramiv, glGetProgramiv)                                                         \
+    X(PFNGLGETPROGRAMINFOLOGPROC, GetProgramInfoLog, glGetProgramInfoLog)                                          \
+    X(PFNGLUSEPROGRAMPROC, UseProgram, glUseProgram)                                                               \
+    X(PFNGLGETUNIFORMLOCATIONPROC, GetUniformLocation, glGetUniformLocation)                                       \
+    X(PFNGLUNIFORM1IPROC, Uniform1i, glUniform1i)                                                                  \
+    X(PFNGLUNIFORM1FPROC, Uniform1f, glUniform1f)                                                                  \
+    X(PFNGLUNIFORM2FPROC, Uniform2f, glUniform2f)                                                                  \
+    X(PFNGLUNIFORM3FPROC, Uniform3f, glUniform3f)                                                                  \
+    X(PFNGLUNIFORM4FPROC, Uniform4f, glUniform4f)                                                                  \
+    X(PFNGLGENVERTEXARRAYSPROC, GenVertexArrays, glGenVertexArrays)                                                \
+    X(PFNGLBINDVERTEXARRAYPROC, BindVertexArray, glBindVertexArray)                                                \
+    X(PFNGLGENBUFFERSPROC, GenBuffers, glGenBuffers)                                                               \
+    X(PFNGLBINDBUFFERPROC, BindBuffer, glBindBuffer)                                                               \
+    X(PFNGLBUFFERDATAPROC, BufferData, glBufferData)                                                               \
+    X(PFNGLMAPBUFFERRANGEPROC, MapBufferRange, glMapBufferRange)                                                   \
+    X(PFNGLUNMAPBUFFERPROC, UnmapBuffer, glUnmapBuffer)                                                            \
+    X(PFNGLFENCESYNCPROC, FenceSync, glFenceSync)                                                                  \
+    X(PFNGLCLIENTWAITSYNCPROC, ClientWaitSync, glClientWaitSync)                                                   \
+    X(PFNGLDELETESYNCPROC, DeleteSync, glDeleteSync)                                                               \
+    X(PFNGLVERTEXATTRIBPOINTERPROC, VertexAttribPointer, glVertexAttribPointer)                                    \
+    X(PFNGLENABLEVERTEXATTRIBARRAYPROC, EnableVertexAttribArray, glEnableVertexAttribArray)                        \
+    X(MhfDrawArrays, DrawArrays, glDrawArrays)                                                                     \
+    X(MhfReadPixels, ReadPixels, glReadPixels)
+
+struct Gl {
+#define MHF_GL_MEMBER(type, name, symbol) type name{};
+    MHF_GL_FUNCTIONS(MHF_GL_MEMBER)
+#undef MHF_GL_MEMBER
+    bool load() {
+        bool ok = true;
+#define MHF_GL_LOAD(type, name, symbol)                                                                            \
+    name = reinterpret_cast<type>(SDL_GL_GetProcAddress(#symbol));                                                 \
+    if (name == nullptr) {                                                                                         \
+        std::fprintf(stderr, "[gl] missing %s\n", #symbol);                                                       \
+        ok = false;                                                                                                \
+    }
+        MHF_GL_FUNCTIONS(MHF_GL_LOAD)
+#undef MHF_GL_LOAD
+        return ok;
+    }
+};
+
+// ---------------------------------------------------------------- shaders
+
+constexpr const char *kDrawVertex = R"(#version 330 core
+layout(location = 0) in vec4 a_pos;   // x, y in PSP pixels, z 0..65535, 1/w
+layout(location = 1) in vec2 a_uv;
+layout(location = 2) in vec4 a_color;
+layout(location = 3) in vec4 a_spec;
+layout(location = 4) in float a_fog;
+uniform vec2 u_target;                // render target size in PSP pixels
+uniform vec4 u_uv_xform;              // scale.xy, offset.zw
+out vec2 v_uv;
+out vec4 v_color;
+out vec3 v_spec;
+out float v_fog;
+void main() {
+    float w = 1.0 / a_pos.w;
+    vec2 ndc = a_pos.xy / u_target * 2.0 - 1.0;
+    float z = clamp(a_pos.z / 65535.0, 0.0, 1.0) * 2.0 - 1.0;
+    gl_Position = vec4(ndc * w, z * w, w);
+    v_uv = a_uv * u_uv_xform.xy + u_uv_xform.zw;
+    v_color = a_color;
+    v_spec = a_spec.rgb;
+    v_fog = a_fog;
+}
+)";
+
+constexpr const char *kDrawFragment = R"(#version 330 core
+in vec2 v_uv;
+in vec4 v_color;
+in vec3 v_spec;
+in float v_fog;
+uniform sampler2D u_tex;
+uniform int u_tex_enable;
+uniform int u_tex_func;
+uniform int u_tex_rgba;
+uniform int u_tex_double;
+uniform vec3 u_env;
+uniform int u_clear;
+uniform int u_fog_enable;
+uniform vec3 u_fog_color;
+uniform int u_alpha_func;
+uniform int u_alpha_ref;
+uniform int u_alpha_mask;
+uniform int u_zrange_enable;
+uniform vec2 u_zrange;
+out vec4 o_color;
+bool compare(int f, int a, int b) {
+    if (f == 0) return false;
+    if (f == 1) return true;
+    if (f == 2) return a == b;
+    if (f == 3) return a != b;
+    if (f == 4) return a < b;
+    if (f == 5) return a <= b;
+    if (f == 6) return a > b;
+    return a >= b;
+}
+void main() {
+    vec4 c = v_color;
+    if (u_clear == 0) {
+        if (u_tex_enable != 0) {
+            vec4 t = texture(u_tex, v_uv);
+            if (u_tex_func == 0) { c.rgb *= t.rgb; if (u_tex_rgba != 0) c.a *= t.a; }
+            else if (u_tex_func == 1) { c.rgb = u_tex_rgba != 0 ? mix(c.rgb, t.rgb, t.a) : t.rgb; }
+            else if (u_tex_func == 2) { c.rgb = mix(c.rgb, u_env, t.rgb); if (u_tex_rgba != 0) c.a *= t.a; }
+            else if (u_tex_func == 3) { c.rgb = t.rgb; if (u_tex_rgba != 0) c.a = t.a; }
+            else { c.rgb += t.rgb; if (u_tex_rgba != 0) c.a *= t.a; }
+            if (u_tex_double != 0) c.rgb *= 2.0;
+        }
+        c.rgb = min(c.rgb + v_spec, vec3(1.0));
+        if (u_fog_enable != 0) c.rgb = mix(u_fog_color, c.rgb, clamp(v_fog, 0.0, 1.0));
+        if (u_alpha_func != 1) {
+            int a = int(clamp(c.a, 0.0, 1.0) * 255.0 + 0.5) & u_alpha_mask;
+            if (!compare(u_alpha_func, a, u_alpha_ref & u_alpha_mask)) discard;
+        }
+        if (u_zrange_enable != 0) {
+            float z = gl_FragCoord.z * 65535.0;
+            if (z < u_zrange.x || z > u_zrange.y + 0.5) discard;
+        }
+    }
+    o_color = clamp(c, 0.0, 1.0);
+}
+)";
+
+// Draws a texture over the whole viewport; row 0 of the texture (PSP line 0) at the top.
+constexpr const char *kPresentVertex = R"(#version 330 core
+uniform vec2 u_uv_max;
+out vec2 v_uv;
+void main() {
+    vec2 p = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    v_uv = vec2(p.x, 1.0 - p.y) * u_uv_max;
+}
+)";
+
+constexpr const char *kPresentFragment = R"(#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+out vec4 o_color;
+void main() { o_color = vec4(texture(u_tex, v_uv).rgb, 1.0); }
+)";
+
+// The dialog overlay: premultiplied colour, faded in by u_alpha.
+constexpr const char *kOverlayFragment = R"(#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform float u_alpha;
+out vec4 o_color;
+void main() { o_color = texture(u_tex, v_uv) * u_alpha; }
+)";
+
+// The blurred background of the in-game menu: a picture drawn into a small target and blurred there. The vertex shader
+// does not flip (the targets are read back the way they were written) and maps the quad onto a part of the texture.
+constexpr const char *kBlurVertex = R"(#version 330 core
+uniform vec2 u_uv_off;
+uniform vec2 u_uv_scale;
+out vec2 v_uv;
+void main() {
+    vec2 p = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    v_uv = u_uv_off + p * u_uv_scale;
+}
+)";
+
+// Five taps that stand for nine of a Gaussian (the two outer ones sample between texels), darkened by u_dim.
+constexpr const char *kBlurFragment = R"(#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform vec2 u_dir;
+uniform float u_dim;
+out vec4 o_color;
+void main() {
+    vec3 c = texture(u_tex, v_uv).rgb * 0.2270270270;
+    c += texture(u_tex, v_uv + u_dir * 1.3846153846).rgb * 0.3162162162;
+    c += texture(u_tex, v_uv - u_dir * 1.3846153846).rgb * 0.3162162162;
+    c += texture(u_tex, v_uv + u_dir * 3.2307692308).rgb * 0.0702702703;
+    c += texture(u_tex, v_uv - u_dir * 3.2307692308).rgb * 0.0702702703;
+    o_color = vec4(c * u_dim, 1.0);
+}
+)";
+
+// ---------------------------------------------------------------- pixel helpers
+
+std::uint32_t expand(std::uint32_t v, int bits) {
+    return bits == 5 ? (v << 3u) | (v >> 2u) : bits == 6 ? (v << 2u) | (v >> 4u) : (v << 4u) | v;
+}
+
+// PSP framebuffer pixel (format 0..3) to ABGR8888.
+std::uint32_t framebuffer_pixel(const std::uint8_t *p, std::uint32_t format) {
+    if (format == 3) {
+        std::uint32_t c;
+        std::memcpy(&c, p, 4);
+        return c;
+    }
+    std::uint16_t v;
+    std::memcpy(&v, p, 2);
+    std::uint32_t r, g, b, a;
+    if (format == 0) { r = expand(v & 31u, 5); g = expand((v >> 5u) & 63u, 6); b = expand((v >> 11u) & 31u, 5); a = 255; }
+    else if (format == 1) { r = expand(v & 31u, 5); g = expand((v >> 5u) & 31u, 5); b = expand((v >> 10u) & 31u, 5); a = (v & 0x8000u) ? 255u : 0u; }
+    else { r = expand(v & 15u, 4); g = expand((v >> 4u) & 15u, 4); b = expand((v >> 8u) & 15u, 4); a = expand(v >> 12u, 4); }
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
+void unpack_rgb(std::uint32_t c, float out[3]) {
+    out[0] = static_cast<float>(c & 0xFFu) / 255.0f;
+    out[1] = static_cast<float>((c >> 8u) & 0xFFu) / 255.0f;
+    out[2] = static_cast<float>((c >> 16u) & 0xFFu) / 255.0f;
+}
+
+struct GpuVertex {
+    float x, y, z, inv_w;
+    float u, v;
+    std::uint8_t color[4];
+    std::uint8_t spec[4];
+    float fog;
+};
+
+using DrawKey = std::array<std::uint32_t, kStateRegs.size() + 2>;
+
+// The value of a state register as it was when `key` was captured (kStateRegs plus the alpha mask).
+// Where each register sits in a DrawKey (-1: not a draw-state register).
+constexpr std::array<int, 256> kKeyIndex = [] {
+    std::array<int, 256> index{};
+    index.fill(-1);
+    for (std::size_t i = 0; i < kStateRegs.size(); ++i) index[kStateRegs[i] & 0xFFu] = static_cast<int>(i);
+    return index;
+}();
+
+std::uint32_t key_reg(const DrawKey &key, std::uint32_t reg) {
+    if (reg == kMaskAlpha) return key[kStateRegs.size() + 1];
+    const int i = kKeyIndex[reg & 0xFFu];
+    return i >= 0 ? key[static_cast<std::size_t>(i)] : 0; // not a draw-state register: nothing here reads one
+}
+
+// Everything needed to set up OpenGL for a batch of primitives: the registers plus what was resolved from guest
+// memory when the batch started (the texture and the render target).
+struct DrawSetup {
+    DrawKey key{};
+    GLuint texture{};     // 0: untextured
+    float uv_xform[4]{1, 1, 0, 0};
+    bool texture_mips{};          // the texture has mip levels (a texture pack image)
+    std::uint8_t texture_filter{}; // a texture pack's [filtering] for it: 0 the game's, 1 nearest, 2 linear
+    bool through{};
+    float tex_width{1}, tex_height{1};
+    std::uint32_t target{}; // VRAM offset of the render target
+    bool self_sampled{};    // the texture is a copy of the target being drawn: it cannot be replayed later
+};
+
+// The camera a vertex was placed with: view and projection matrices, viewport and screen offset.
+struct Camera {
+    std::array<float, 12> view{};
+    std::array<float, 16> proj{};
+    std::array<float, 8> viewport{}; // x, y, z scale; x, y, z center; x, y offset
+    bool operator==(const Camera &) const = default;
+};
+constexpr std::uint16_t kNoCamera = 0xFFFF;
+
+// Where a recorded vertex came from, to place it again for an in-between picture (frame interpolation): its point in
+// the world (before the view matrix) and the camera. Sprite corners take x and y from different points.
+struct Origin {
+    float x_world[3]{}, y_world[3]{};
+    std::uint64_t x_key{}, y_key{};  // the same point in another flip has the same key (0: no identity)
+    std::uint16_t camera{kNoCamera}; // kNoCamera: drawn where it was recorded
+    bool sprite{};
+    // Where the same points were in the previous flip, when they were drawn then (filled in for the flip shown).
+    bool x_moved{}, y_moved{};
+    float x_before[3]{}, y_before[3]{};
+};
+
+// Where a register sits in a DrawKey.
+constexpr std::size_t state_index(std::uint32_t reg) {
+    for (std::size_t i = 0; i < kStateRegs.size(); ++i) {
+        if (kStateRegs[i] == reg) return i;
+    }
+    return kStateRegs.size();
+}
+
+// Effects: blended and not writing depth (particles such as dust and smoke, but also layers such as the snow over the
+// terrain).
+bool is_effect(const DrawKey &key) {
+    return (key[state_index(kAlphaBlendEnable)] & 1u) != 0 && (key[state_index(kZWriteDisable)] & 1u) != 0;
+}
+
+// A particle system reuses the memory of a particle that ended for a new one somewhere else, and the points are paired
+// by that memory: moving them back drew the new particle on its way from the old one (fragments around the footsteps at
+// 180 fps). A triangle of a reused particle jumps several times its own size in one flip, which the triangles of a layer
+// such as the snow over the terrain never do (measured: none in a run through the village), although their points shift
+// a little every flip and need their pairing. So in an effect, a piece (triangles joined by shared points) in which any
+// fully paired triangle jumped more than twice its own size is drawn where this flip put it, through the interpolated
+// camera, as a whole so that no shared point is torn apart. Everything else keeps its pairing.
+void unpair_jumping_particles(std::vector<Origin> &origins) {
+    for (const Origin &o : origins) {
+        if (o.sprite) return; // triangles only (sprites take x and y from different points)
+    }
+    const std::size_t count = origins.size() / 3;
+    if (count == 0) return;
+    const auto distance = [](const float *a, const float *b) {
+        const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    // Triangles that jumped.
+    std::vector<bool> jumped(count, false);
+    bool any = false;
+    for (std::size_t t = 0; t < count; ++t) {
+        const Origin *p = &origins[t * 3];
+        if (!p[0].x_moved || !p[1].x_moved || !p[2].x_moved) continue;
+        const float size = std::max({distance(p[0].x_world, p[1].x_world), distance(p[1].x_world, p[2].x_world),
+                                     distance(p[0].x_world, p[2].x_world)});
+        const float jump = std::max({distance(p[0].x_world, p[0].x_before), distance(p[1].x_world, p[1].x_before),
+                                     distance(p[2].x_world, p[2].x_before)});
+        jumped[t] = jump > 2.0f * size;
+        any = any || jumped[t];
+    }
+    if (!any) return;
+    // Pieces: triangles that share a point (the same key) are joined.
+    std::vector<std::size_t> parent(count);
+    for (std::size_t i = 0; i < count; ++i) parent[i] = i;
+    const auto root = [&](std::size_t i) {
+        while (parent[i] != i) i = parent[i] = parent[parent[i]];
+        return i;
+    };
+    std::unordered_map<std::uint64_t, std::size_t> owner;
+    owner.reserve(origins.size());
+    for (std::size_t i = 0; i < origins.size(); ++i) {
+        if (origins[i].x_key == 0) continue;
+        const auto [it, fresh] = owner.emplace(origins[i].x_key, i / 3);
+        if (!fresh) parent[root(i / 3)] = root(it->second);
+    }
+    std::vector<bool> piece_jumped(count, false);
+    for (std::size_t t = 0; t < count; ++t) {
+        if (jumped[t]) piece_jumped[root(t)] = true;
+    }
+    for (std::size_t t = 0; t < count; ++t) {
+        if (!piece_jumped[root(t)]) continue;
+        for (std::size_t a = t * 3; a < t * 3 + 3; ++a) origins[a].x_moved = origins[a].y_moved = false;
+    }
+}
+
+// Interpolation v2: a 3D triangle as the GE had it before clipping, to be moved, clipped and placed again for each
+// in-between picture: its points in the world (after the world matrix), what the vertices carry, and its draw.
+struct RawVertex {
+    float world[3];
+    float u, v;
+    std::uint8_t color[4], spec[4];
+    float fog;
+};
+struct RawTriangle {
+    RawVertex v[3];
+    std::uint32_t draw; // index into the flip's draw summaries
+};
+
+// One batch of primitives as it was drawn, kept to draw it again between two flips (frame interpolation).
+struct TapeEntry {
+    DrawSetup setup;
+    std::vector<GpuVertex> vertices;
+    std::vector<Origin> origins; // one per vertex
+    std::vector<RawTriangle> raw; // interpolation v2: the batch's 3D triangles before clipping
+    bool raw_complete = true;     // every primitive of the batch is among them (no 3D sprite, no point without a world)
+};
+
+// A copy of a finished picture (the last two are kept).
+struct Slot {
+    GLuint texture{}, fbo{};
+    GLsizei width{}, height{};
+};
+
+std::uint8_t to_byte(float v) { return static_cast<std::uint8_t>(std::clamp(v, 0.0f, 255.0f) + 0.5f); }
+
+// ---------------------------------------------------------------- the backend
+
+class GlBackend final : public gpu::Backend {
+public:
+    GlBackend(SDL_Window *window, int scale, psprecomp::GuestMemory &memory, bool smooth_textures,
+              OverlayImage *overlay, int factor, LiveSettings *live)
+        : window_(window), scale_(std::max(1, scale)), memory_(memory), live_(live != nullptr ? live : &own_live_),
+          overlay_(overlay), factor_(std::clamp(factor, 1, 6)), interpolate_(factor > 1) {
+        if (live == nullptr) own_live_.smooth_textures = smooth_textures;
+        open_texture_pack();
+    }
+
+    ~GlBackend() override {
+        if (context_ != nullptr) SDL_GL_DestroyContext(context_);
+    }
+
+    bool init();
+
+    void triangle(const gpu::Ge &ge, const gpu::Vertex &a, const gpu::Vertex &b, const gpu::Vertex &c) override {
+        prepare(ge);
+        if (!through_ && !(a.has_world && b.has_world && c.has_world)) raw_incomplete(); // a 3D line, say
+        const bool flat = (ge.reg(kShadeMode) & 1u) == 0;
+        push(a, flat ? &c : nullptr);
+        push(b, flat ? &c : nullptr);
+        push(c, nullptr);
+        if (needs_origins()) {
+            const std::uint16_t camera = a.has_world && b.has_world && c.has_world ? camera_for(ge) : kNoCamera;
+            record(a, a, camera, false);
+            record(b, b, camera, false);
+            record(c, c, camera, false);
+        }
+    }
+
+    void draw_started(const gpu::DrawInfo &draw) override {
+        ++draw_serial_; // the GE's state can only have changed since the last draw
+        if (!interpolate_) return;
+        draw_use_ = ++draw_uses_[draw.vertex_address];
+        recording_.push_back(interpolation::summarize(draw));
+        recording_viewports_.push_back(draw.viewport);
+    }
+
+    void triangle_unclipped(const gpu::Ge &ge, const gpu::Vertex &a, const gpu::Vertex &b, const gpu::Vertex &c) override {
+        if (!interpolate_ || !v2_enabled_ || recording_.empty()) return;
+        prepare(ge);
+        if (!a.has_world || !b.has_world || !c.has_world) {
+            raw_incomplete();
+            return;
+        }
+        const bool flat = (ge.reg(kShadeMode) & 1u) == 0;
+        RawTriangle t;
+        t.draw = static_cast<std::uint32_t>(recording_.size() - 1);
+        const gpu::Vertex *in[3] = {&a, &b, &c};
+        for (int i = 0; i < 3; ++i) {
+            const gpu::Vertex &v = *in[i];
+            const gpu::Vertex &col = flat ? c : v; // flat shading: the last vertex's colour
+            RawVertex &r = t.v[i];
+            std::copy(v.world, v.world + 3, r.world);
+            r.u = v.u;
+            r.v = v.v;
+            r.color[0] = to_byte(col.r); r.color[1] = to_byte(col.g); r.color[2] = to_byte(col.b); r.color[3] = to_byte(col.a);
+            r.spec[0] = to_byte(col.sr); r.spec[1] = to_byte(col.sg); r.spec[2] = to_byte(col.sb); r.spec[3] = 0;
+            r.fog = v.fog;
+        }
+        raw_batch_.push_back(t);
+    }
+
+    void sprite(const gpu::Ge &ge, const gpu::Vertex &a, const gpu::Vertex &b) override {
+        prepare(ge);
+        if (!through_) raw_incomplete(); // a 3D sprite: interpolation v2 cannot make this batch again
+        gpu::Vertex tl = b, tr = b, bl = b, br = b;
+        tl.x = a.x; tl.y = a.y; tl.u = a.u; tl.v = a.v;
+        tr.x = b.x; tr.y = a.y; tr.u = b.u; tr.v = a.v;
+        bl.x = a.x; bl.y = b.y; bl.u = a.u; bl.v = b.v;
+        for (gpu::Vertex *v : {&tl, &tr, &bl, &br}) v->w = 1.0f; // sprites interpolate linearly
+        push(tl, nullptr);
+        push(tr, nullptr);
+        push(bl, nullptr);
+        push(tr, nullptr);
+        push(br, nullptr);
+        push(bl, nullptr);
+        if (needs_origins()) {
+            const std::uint16_t camera = a.has_world && b.has_world ? camera_for(ge) : kNoCamera;
+            record(a, a, camera, true); // top left: x and y from a
+            record(b, a, camera, true); // top right
+            record(a, b, camera, true); // bottom left
+            record(b, a, camera, true);
+            record(b, b, camera, true); // bottom right
+            record(a, b, camera, true);
+        }
+    }
+
+    void block_transfer(std::uint32_t src, std::uint32_t src_stride, std::uint32_t sx, std::uint32_t sy,
+                        std::uint32_t dst, std::uint32_t dst_stride, std::uint32_t dx, std::uint32_t dy,
+                        std::uint32_t width, std::uint32_t height, std::uint32_t bpp) override;
+
+    void flush() override;
+
+    void present(std::uint32_t address, std::uint32_t stride, std::uint32_t pixel_format) override;
+
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> next_wakeup() const override {
+        if (pacing_.active) return pacing_.next_due;
+        if (overlay_ != nullptr) { // the menu is up: redraw it every refresh, even when the game shows nothing new
+            std::lock_guard lock(overlay_->mutex);
+            if (overlay_->continuous) return last_show_ + std::chrono::milliseconds(16);
+        }
+        return std::nullopt;
+    }
+    void tick() override;
+
+private:
+    void apply_live_scale();
+    void apply_live_fps();
+    void build_blur(GLuint source, float uv_max_x, float uv_max_y);
+    void draw_blurred_background(int window_w, int window_h);
+    struct RenderTarget {
+        std::uint32_t address{}; // VRAM offset
+        std::uint32_t stride{};  // pixels per line
+        std::uint32_t width{}, height{};
+        std::uint32_t format{};
+        GLuint fbo{}, color{}, depth{};
+        std::uint64_t last_draw{}; // present count when last drawn by the GE
+        std::uint64_t last_use{};
+        std::uint64_t copied{}; // present count + 1 when last copied back to VRAM (copy_shown_to_vram), 0: never
+        [[nodiscard]] std::uint32_t bytes_per_pixel() const { return format == 3 ? 4u : 2u; }
+        [[nodiscard]] std::uint32_t end() const { return address + stride * height * bytes_per_pixel(); }
+    };
+    struct CachedTexture {
+        GLuint texture{};
+        std::uint64_t hash{};
+        std::uint64_t checked_frame{~0ull};
+        std::uint64_t checked_clut{~0ull};
+        std::uint64_t last_use{};
+        // Texture pack: the image drawn instead of the game's (`shown`: its texture is then pack_images_'s, not this
+        // slot's), the one being decoded for it (its name and files, and the loader generation last looked at), the
+        // part of the texture it covers, its [filtering], and the lowest row drawn in through mode (512-tall textures
+        // are hashed down to it).
+        bool mips{};
+        std::uint8_t filter{};
+        float uv_scale[2]{1.0f, 1.0f};
+        std::string pending, shown; // being decoded; on the GPU
+        std::vector<std::filesystem::path> pending_files;
+        std::uint64_t pending_generation{~0ull};
+        std::uint16_t max_seen_v{}, keyed_max_v{};
+    };
+
+    void prepare(const gpu::Ge &ge) {
+        if (have_state_ && prepared_serial_ == draw_serial_) return; // the same draw: the same state
+        prepared_serial_ = draw_serial_;
+        DrawKey key{};
+        for (std::size_t i = 0; i < kStateRegs.size(); ++i) key[i] = ge.reg(kStateRegs[i]);
+        key[kStateRegs.size()] = static_cast<std::uint32_t>(ge.clut_generation());
+        key[kStateRegs.size() + 1] = ge.reg(kMaskAlpha);
+        if (have_state_ && key == state_key_) return;
+        draw_batch();
+        state_key_ = key;
+        have_state_ = true;
+        apply_state(ge);
+    }
+
+    void push(const gpu::Vertex &v, const gpu::Vertex *color_from) {
+        const gpu::Vertex &c = color_from != nullptr ? *color_from : v;
+        GpuVertex g{};
+        g.x = v.x;
+        g.y = v.y;
+        g.z = v.z;
+        g.inv_w = through_ ? 1.0f : (v.w > 0.0f ? v.w : 1.0f);
+        g.u = through_ ? v.u / tex_width_ : v.u;
+        g.v = through_ ? v.v / tex_height_ : v.v;
+        // Texture packs hash 512-tall textures drawn in through mode only down to the lowest row drawn.
+        if (seen_v_ != nullptr && through_ && v.v > static_cast<float>(*seen_v_)) *seen_v_ = static_cast<std::uint16_t>(std::min(512.0f, std::ceil(v.v)));
+        g.color[0] = to_byte(c.r); g.color[1] = to_byte(c.g); g.color[2] = to_byte(c.b); g.color[3] = to_byte(c.a);
+        g.spec[0] = to_byte(c.sr); g.spec[1] = to_byte(c.sg); g.spec[2] = to_byte(c.sb); g.spec[3] = 0;
+        g.fog = v.fog;
+        batch_.push_back(g);
+    }
+
+    // Frame interpolation: the camera of the vertices being drawn (an index into cameras_), and where each recorded
+    // vertex came from.
+    std::uint16_t camera_for(const gpu::Ge &ge) {
+        if (camera_ != kNoCamera && camera_generation_ == ge.camera_generation()) return camera_; // nothing was written
+        camera_generation_ = ge.camera_generation();
+        return find_camera(ge);
+    }
+    std::uint16_t find_camera(const gpu::Ge &ge) {
+        Camera c;
+        std::copy(ge.view_matrix().m.begin(), ge.view_matrix().m.end(), c.view.begin());
+        std::copy(ge.proj_matrix().m.begin(), ge.proj_matrix().m.end(), c.proj.begin());
+        c.viewport = {gpu::float24(ge.reg(kViewportXScale)), gpu::float24(ge.reg(kViewportYScale)),
+                      gpu::float24(ge.reg(kViewportZScale)), gpu::float24(ge.reg(kViewportXCenter)),
+                      gpu::float24(ge.reg(kViewportYCenter)), gpu::float24(ge.reg(kViewportZCenter)),
+                      static_cast<float>(ge.reg(kOffsetX) & 0xFFFFu) / 16.0f,
+                      static_cast<float>(ge.reg(kOffsetY) & 0xFFFFu) / 16.0f};
+        if (camera_ < cameras_.size() && cameras_[camera_] == c) return camera_;
+        for (std::size_t i = 0; i < cameras_.size(); ++i) {
+            if (cameras_[i] == c) return camera_ = static_cast<std::uint16_t>(i);
+        }
+        if (cameras_.size() >= kNoCamera) return kNoCamera;
+        cameras_.push_back(c);
+        return camera_ = static_cast<std::uint16_t>(cameras_.size() - 1);
+    }
+    [[nodiscard]] std::uint64_t key_of(const gpu::Vertex &v) const {
+        return v.source == 0 ? 0 : (static_cast<std::uint64_t>(draw_use_) << 32u) | v.source;
+    }
+    void record(const gpu::Vertex &x_from, const gpu::Vertex &y_from, std::uint16_t camera, bool sprite) {
+        Origin o;
+        std::copy(x_from.world, x_from.world + 3, o.x_world);
+        std::copy(y_from.world, y_from.world + 3, o.y_world);
+        o.x_key = key_of(x_from);
+        o.y_key = key_of(y_from);
+        o.camera = camera;
+        o.sprite = sprite;
+        batch_origins_.push_back(o);
+    }
+    void place_again(const TapeEntry &entry, const std::vector<Camera> &cameras, std::span<GpuVertex> vertices,
+                     float t) const;
+
+    void apply_state(const gpu::Ge &ge);
+    void emit_state(const DrawSetup &setup, RenderTarget &rt);
+    void draw_vertices(const std::vector<GpuVertex> &vertices);
+    void show(GLuint texture, float uv_max_x, float uv_max_y);
+    void finish_flip();
+    void copy_shown_to_vram(RenderTarget *shown);
+    bool present_interpolated(RenderTarget &shown, const float uv_max[2]);
+    [[nodiscard]] float phase_at(std::chrono::steady_clock::time_point when) const;
+    void show_between(float phase);
+    void show_final();
+    void flush_pictures();
+    void ensure_slot(Slot &slot, GLsizei w, GLsizei h);
+    void render_between(const RenderTarget &shown, const std::vector<TapeEntry> &now,
+                        const std::vector<TapeEntry> &before, const Slot &before_slot, float t);
+    void draw_batch();
+    void read_back();
+    RenderTarget &target_for(std::uint32_t address, std::uint32_t stride, std::uint32_t format,
+                             std::uint32_t needed_height);
+    RenderTarget *find_target(std::uint32_t vram_offset, bool drawn_only);
+    void allocate(RenderTarget &rt, std::uint32_t height);
+    GLuint texture_for(const gpu::Ge &ge, float uv_xform[4]);
+    void upload_rect(RenderTarget &rt, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h);
+    void copy_to_ram(RenderTarget &from, std::uint32_t src, std::uint32_t sx, std::uint32_t sy, std::uint32_t dst,
+                     std::uint32_t dst_stride, std::uint32_t dx, std::uint32_t dy, std::uint32_t width, std::uint32_t height);
+    GLuint compile(const char *vertex, const char *fragment);
+    GLint uniform(GLuint program, const char *name) { return gl_.GetUniformLocation(program, name); }
+    void set_texture_params(bool linear, bool clamp_s, bool clamp_t, bool mips = false);
+    // Texture packs (frontend/texture_pack.hpp, texture_images.hpp): opening the pack, its key for the current texture
+    // and the image for it, putting a decoded image on the GPU, dumping the game's textures for pack makers, and
+    // keeping pack images within their memory budget.
+    void open_texture_pack();
+    void look_up_pack(const gpu::Ge &ge, const gpu::Ge::TextureInfo &info, CachedTexture &t);
+    void upload_pack_image(CachedTexture &t, const std::string &name, const textures::Image &image);
+    void use_pack_image(CachedTexture &t, const std::string &name);
+    void release_texture(CachedTexture &t);
+    void dump_texture(const gpu::Ge &ge, const gpu::Ge::TextureInfo &info, const std::uint32_t *pixels);
+    void drop_textures();
+    void trim_pack_memory();
+    // Debugging: MHF_GL_DUMP=<folder> writes every MHF_GL_DUMP_EVERY-th (default 60) presented frame as a PPM image,
+    // starting at presented frame MHF_GL_DUMP_FROM (default 0).
+    void dump_window(int w, int h);
+    void draw_overlay();
+
+    SDL_Window *window_;
+    SDL_GLContext context_{};
+    int scale_;
+    psprecomp::GuestMemory &memory_;
+    LiveSettings own_live_;
+    LiveSettings *live_;
+    OverlayImage *overlay_ = nullptr;
+    // The blurred background of the in-game menu (made once per menu, from the picture the game was paused on).
+    static constexpr GLsizei kBlurW = 320, kBlurH = 180;
+    GLuint blur_program_{}, blur_texture_[2]{}, blur_fbo_[2]{};
+    GLint blur_uv_off_{}, blur_uv_scale_{}, blur_tex_{}, blur_dir_{}, blur_dim_{};
+    GLuint blur_source_{}; // the picture the blur was made from
+    bool blur_ready_ = false;
+    bool redraw_only_ = false; // show() draws the same picture again (tick with nothing new): the blur can be kept
+    GLuint last_texture_{}; // the picture shown last, kept on screen while the game is paused behind an overlay
+    float last_uv_[2] = {1.0f, 1.0f};
+    std::chrono::steady_clock::time_point last_show_{};
+    GLuint overlay_program_{}, overlay_texture_{};
+    GLint overlay_tex_{}, overlay_alpha_{}, overlay_uv_max_{};
+    std::uint64_t overlay_generation_{~0ull};
+    bool overlay_visible_{};
+    std::uint64_t overlay_shown_at_{}; // SDL ticks (ms) when it appeared, for the fade-in
+    Gl gl_;
+
+    GLuint draw_program_{}, present_program_{}, vao_{}, vbo_{}, empty_vao_{};
+    struct {
+        GLint target, uv_xform, tex_enable, tex_func, tex_rgba, tex_double, env, clear, fog_enable, fog_color,
+            alpha_func, alpha_ref, alpha_mask, zrange_enable, zrange, tex;
+    } u_{};
+    GLint present_uv_max_{}, present_tex_{};
+
+    std::map<std::uint32_t, RenderTarget> targets_; // by VRAM offset
+    RenderTarget *current_{};
+    std::unordered_map<std::uint64_t, CachedTexture> textures_;
+    std::unique_ptr<textures::Pack> pack_;     // the texture pack, when one was given and could be opened
+    std::unique_ptr<textures::Loader> loader_; // decodes its images
+    bool pack_on_ = false;                     // drawing it (the player can turn it off in the menu)
+    std::size_t pack_bytes_ = 0, pack_budget_ = std::size_t(1024) << 20; // pack images on the GPU, and their limit
+    // Pack images on the GPU, one texture (with its mip levels) per image, shared by every cached texture drawn with it:
+    // the game putting another texture at an address and back, or two keys naming one image, do not upload it again
+    // (ibonplix's idea in pull request #39).
+    struct PackImage {
+        GLuint texture{};
+        std::size_t bytes{};
+        std::uint64_t last_use{};
+    };
+    std::unordered_map<std::string, PackImage> pack_images_;
+    std::uint64_t pack_reused_ = 0;
+    std::uint16_t *seen_v_ = nullptr;          // the lowest through-mode row drawn of the bound texture (packs)
+    // Pack images put on the GPU this flip: a scene arriving with dozens of them spreads them over a few flips instead
+    // of holding one up (each is an upload and its mip levels).
+    static constexpr unsigned kPackUploadsPerFlip = 6;
+    unsigned pack_uploads_ = 0;
+    bool pack_log_ = false;                    // MHF_TEXTURE_LOG=1: each texture's key and what the pack does with it
+    std::uint64_t pack_logged_at_ = 0, pack_replaced_ = 0, pack_missed_ = 0;
+    std::filesystem::path dump_folder_;        // MHF_TEXTURE_DUMP=<folder>: the game's textures as a pack to edit
+    std::unique_ptr<textures::Pack> dump_keys_;
+    std::set<std::string> dumped_;
+    // Textures replaced by new content while a recorded batch (frame interpolation) may still draw with them; they
+    // are deleted a few flips later.
+    std::vector<std::pair<std::uint64_t, GLuint>> retired_textures_;
+    GLuint copy_texture_{}, copy_fbo_{};               // for sampling the target being drawn
+    std::uint32_t copy_width_{}, copy_height_{};
+    GLuint upload_texture_{};                          // CPU pixels on their way to a target or the screen
+    GLuint display_texture_{};
+    // The shown picture on its way back to guest VRAM (copy_shown_to_vram): a 480x272 target and a pixel buffer read one
+    // flip later.
+    GLuint readback_texture_{}, readback_fbo_{}, readback_pbo_{};
+    struct PendingReadback {
+        bool active{};
+        GLsync fence{};
+        std::uint32_t address{}, stride{}, format{}, width{}, height{};
+    } pending_readback_;
+    std::vector<std::uint32_t> pixels_;
+
+    DrawKey state_key_{};
+    DrawSetup setup_{}; // of the batch being collected
+
+    // Frame interpolation (enhancement, off by default). The game flips at 30 fps and the output runs at
+    // `factor_` times that: every flip is followed by factor_ - 1 pictures between it and the next one, each made by
+    // drawing the flip's batches again through a camera between the two flips (3D), with things that moved on their
+    // own placed between their two positions. Pictures are shown at even intervals on a timer the GE worker honours
+    // only while it has no display list to run, so they never slow the game down (late ones are dropped); a flip is
+    // shown (factor_ - 1)/factor_ of a frame late.
+    int factor_ = 1;
+    bool interpolate_ = false;
+    std::vector<TapeEntry> tape_;           // batches since the last flip
+    std::vector<TapeEntry> previous_;       // the last flip's batches that drew to the picture it showed
+    std::vector<Camera> cameras_;           // cameras used since the last flip (Origin::camera indexes them)
+    std::vector<Camera> previous_cameras_;  // the last flip's
+    std::uint16_t camera_{kNoCamera};       // the last one found
+    std::uint64_t camera_generation_{};     // Ge::camera_generation() when it was found
+    std::unordered_map<std::uint32_t, std::uint32_t> draw_uses_; // drawing commands per vertex address since the flip
+    // The second design of frame interpolation (frame_matching.hpp): the draws of the flip being drawn and of the one
+    // before, and how they match (MHF_INTERP_V2_LOG=1 reports it).
+    std::vector<interpolation::DrawSummary> recording_, summaries_before_;
+    interpolation::Matcher matcher_;
+    interpolation::CutThresholds cut_thresholds_;
+    void match_v2(std::uint32_t shown);
+    // Interpolation v2 (the default; MHF_INTERP_V1=1 goes back to placing the recorded points again for every batch):
+    // the batch's triangles before clipping, the viewports of the draws,
+    // and for the flip being shown: the previous flip's draws, how they match, the camera's motion, and per draw of
+    // this flip its partner in the previous one (-1 none).
+    const bool v2_enabled_ = std::getenv("MHF_INTERP_V1") == nullptr;
+    std::vector<RawTriangle> raw_batch_;
+    bool raw_complete_ = true;
+    std::uint64_t draw_serial_ = 0, prepared_serial_ = ~0ull;
+    // Where each recorded vertex came from (Origin) is for the first design's placing again: with v2, only the 2D
+    // batches and the 3D ones v2 cannot make again need it.
+    bool needs_origins() const { return interpolate_ && (!v2_enabled_ || through_ || !raw_complete_); }
+    void raw_incomplete() {
+        if (!raw_complete_) return;
+        raw_complete_ = false;
+        if (interpolate_ && v2_enabled_) batch_origins_.resize(batch_.size()); // drawn where they were recorded
+    }
+    std::vector<std::array<float, 8>> recording_viewports_, viewports_now_;
+    std::vector<interpolation::DrawSummary> v2_older_;
+    std::vector<std::int32_t> v2_older_of_;
+    interpolation::RigidMotion v2_camera_;
+    bool v2_ready_ = false; // the flip being shown matched the one before, without a cut
+    // What of each draw's transform does not depend on the moment, worked out once a flip (prepare_v2): a point in
+    // the world goes back to the model (back), then to eye space at the moment (blended from older_eye to own, kept
+    // at own, or following the camera), then through the projection. Fixed draws keep the transform they were drawn
+    // with.
+    struct V2Draw {
+        enum Kind : std::uint8_t { kFixed, kStill, kBlend, kFollow } kind = kFixed;
+        interpolation::Matrix fixed, older_eye, own, back, projection_old, projection_new;
+        // An animated (skinned) draw whose partner drew as many triangles: each point is blended between where it was
+        // in the model then (back_old) and now, its triangles found again by their order in the draw.
+        bool deform = false;
+        std::size_t old_first = 0, new_first = 0;
+        interpolation::Matrix back_old;
+    };
+    // A share of a batch's triangles, placed by one thread into its own vertices.
+    struct V2Chunk {
+        std::size_t batch, from, to;
+    };
+    bool v2_prepared_ = false;
+    std::vector<V2Draw> v2_draws_;
+    std::vector<std::uint32_t> v2_needed_; // the draws the shown picture's 3D batches come from
+    std::vector<V2Chunk> v2_chunks_;
+    std::vector<std::size_t> v2_first_chunk_; // per batch
+    std::vector<std::vector<GpuVertex>> v2_chunk_out_;
+    std::vector<interpolation::Matrix> v2_transforms_; // per draw: world point to clip space at the picture's moment
+    void prepare_v2(const std::vector<TapeEntry> &now, const std::vector<TapeEntry> &before);
+    // The triangles of the previous flip in drawing order, and per draw of either flip where its triangles start and
+    // how many there are; per batch of this flip, the order of its first triangle.
+    std::vector<const RawTriangle *> v2_old_tris_;
+    std::vector<std::size_t> v2_old_first_, v2_old_count_, v2_new_first_, v2_new_count_, v2_batch_ordinal_;
+    std::vector<interpolation::Matrix> v2_view_t_; // per deforming draw: eye space to clip space at the moment
+    float v2_t_ = 1.0f;
+    void prepare_v2_draw(std::uint32_t n);
+    void place_v2(std::size_t batch, const TapeEntry &entry, std::size_t from, std::size_t to, std::vector<GpuVertex> &out) const;
+    std::uint32_t draw_use_{};              // of the current drawing command: tells repeated draws of a model apart
+    struct PointSlot {
+        std::uint64_t key{};
+        const float *position{};
+    };
+    std::vector<PointSlot> point_table_; // scratch: the previous flip's points by key (open addressing, reused)
+    std::set<std::uint32_t> touched_;       // render targets written by something other than batches (copies)
+    bool previous_valid_ = false;
+    Slot slots_[2];
+    int fill_slot_ = 0;
+    RenderTarget scratch_;                  // where in-between pictures are drawn
+    // The flip being shown: what later pictures are made from.
+    struct {
+        const std::vector<TapeEntry> *now{}; // this flip's batches: previous_ once the flip has been recorded
+        std::vector<TapeEntry> before;
+        std::vector<Camera> cameras;        // of `now`
+        std::vector<Camera> cameras_before; // the camera of `before` each one continues (or the same one)
+        std::vector<int> partner;           // per batch of `now`: the 2D batch of `before` it continues, or -1
+        std::uint32_t address{}, width{}, height{}, stride{}, format{};
+        int before_slot{};
+        GLuint final_texture{};
+        float uv_max[2]{1, 1};
+    } flip_;
+    // The flip being shown, in time: in-between pictures go out as often as the drawing thread can, at most one per
+    // step (the chosen rate), each one placed where things are at the moment it is drawn; there is no fixed slot a
+    // late picture could miss, so the output rate is free between the game's 30 and the chosen one.
+    struct {
+        bool active{};
+        std::chrono::steady_clock::time_point start{}, next_due{};
+        std::chrono::steady_clock::duration interval{}, step{};
+    } pacing_;
+    std::uint64_t log_shown_{};                       // shown_ at the last log line
+    std::chrono::steady_clock::time_point log_time_{}; // and when
+    // In-between pictures are built in one buffer, uploaded once, and drawn batch by batch from ranges of it.
+    std::vector<GpuVertex> staging_;
+    struct Range {
+        std::size_t first{}, count{};
+    };
+    std::vector<Range> ranges_;
+    // What an in-between picture costs the drawing thread (MHF_INTERP_LOG=1): calculating the vertices, uploading them,
+    // setting the state of each batch, and the draw calls.
+    struct PictureCost {
+        std::uint64_t pictures{}, batches{}, vertices{}, shows{};
+        double calc_us{}, upload_us{}, state_us{}, draw_us{};
+        double show_us{}, swap_us{}; // putting a picture on the window, and the buffer swap inside it (waits for the GPU)
+    } cost_;
+    std::chrono::steady_clock::time_point last_flip_{};
+    std::uint64_t shown_{1};                // pictures put on screen
+    struct {
+        std::uint64_t interpolated{}, skipped_shape{}, skipped_copy{}, skipped_timing{}, skipped_first{}, skipped_ui{}, late{};
+    } stats_;
+    bool have_state_{};
+    bool through_{};
+    float tex_width_{1}, tex_height_{1};
+    bool tex_mips_ = false;          // the texture texture_for() gave has mip levels (a pack image)
+    std::uint8_t tex_filter_ = 0;    // and its pack [filtering]
+    std::vector<GpuVertex> batch_;
+    std::vector<Origin> batch_origins_; // frame interpolation: one per vertex of batch_
+    std::uint64_t frame_{1};
+};
+
+bool GlBackend::init() {
+    context_ = SDL_GL_CreateContext(window_);
+    if (context_ == nullptr) {
+        std::fprintf(stderr, "[gl] cannot create an OpenGL 3.3 context: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_GL_MakeCurrent(window_, context_);
+    SDL_GL_SetSwapInterval(0); // pacing comes from the emulated vblank
+    if (!gl_.load()) return false;
+    std::fprintf(stderr, "[gl] %s, %s, internal resolution %dx%d\n",
+                 reinterpret_cast<const char *>(gl_.GetString(GL_RENDERER)),
+                 reinterpret_cast<const char *>(gl_.GetString(GL_VERSION)), 480 * scale_, 272 * scale_);
+    draw_program_ = compile(kDrawVertex, kDrawFragment);
+    present_program_ = compile(kPresentVertex, kPresentFragment);
+    overlay_program_ = compile(kPresentVertex, kOverlayFragment);
+    blur_program_ = compile(kBlurVertex, kBlurFragment);
+    if (draw_program_ == 0 || present_program_ == 0 || overlay_program_ == 0 || blur_program_ == 0) return false;
+    blur_uv_off_ = uniform(blur_program_, "u_uv_off");
+    blur_uv_scale_ = uniform(blur_program_, "u_uv_scale");
+    blur_tex_ = uniform(blur_program_, "u_tex");
+    blur_dir_ = uniform(blur_program_, "u_dir");
+    blur_dim_ = uniform(blur_program_, "u_dim");
+    overlay_tex_ = uniform(overlay_program_, "u_tex");
+    overlay_alpha_ = uniform(overlay_program_, "u_alpha");
+    overlay_uv_max_ = uniform(overlay_program_, "u_uv_max");
+    gl_.GenTextures(1, &overlay_texture_);
+    u_.target = uniform(draw_program_, "u_target");
+    u_.uv_xform = uniform(draw_program_, "u_uv_xform");
+    u_.tex_enable = uniform(draw_program_, "u_tex_enable");
+    u_.tex_func = uniform(draw_program_, "u_tex_func");
+    u_.tex_rgba = uniform(draw_program_, "u_tex_rgba");
+    u_.tex_double = uniform(draw_program_, "u_tex_double");
+    u_.env = uniform(draw_program_, "u_env");
+    u_.clear = uniform(draw_program_, "u_clear");
+    u_.fog_enable = uniform(draw_program_, "u_fog_enable");
+    u_.fog_color = uniform(draw_program_, "u_fog_color");
+    u_.alpha_func = uniform(draw_program_, "u_alpha_func");
+    u_.alpha_ref = uniform(draw_program_, "u_alpha_ref");
+    u_.alpha_mask = uniform(draw_program_, "u_alpha_mask");
+    u_.zrange_enable = uniform(draw_program_, "u_zrange_enable");
+    u_.zrange = uniform(draw_program_, "u_zrange");
+    u_.tex = uniform(draw_program_, "u_tex");
+    present_uv_max_ = uniform(present_program_, "u_uv_max");
+    present_tex_ = uniform(present_program_, "u_tex");
+
+    gl_.GenVertexArrays(1, &vao_);
+    gl_.GenVertexArrays(1, &empty_vao_);
+    gl_.GenBuffers(1, &vbo_);
+    gl_.BindVertexArray(vao_);
+    gl_.BindBuffer(GL_ARRAY_BUFFER, vbo_);
+    const auto stride = static_cast<GLsizei>(sizeof(GpuVertex));
+    gl_.VertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void *>(offsetof(GpuVertex, x)));
+    gl_.VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void *>(offsetof(GpuVertex, u)));
+    gl_.VertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, reinterpret_cast<void *>(offsetof(GpuVertex, color)));
+    gl_.VertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, reinterpret_cast<void *>(offsetof(GpuVertex, spec)));
+    gl_.VertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void *>(offsetof(GpuVertex, fog)));
+    for (GLuint i = 0; i < 5; ++i) gl_.EnableVertexAttribArray(i);
+
+    GLuint textures[4];
+    gl_.GenTextures(4, textures);
+    copy_texture_ = textures[0];
+    upload_texture_ = textures[1];
+    display_texture_ = textures[2];
+    gl_.GenFramebuffers(1, &copy_fbo_);
+    gl_.Enable(GL_DEPTH_CLAMP);
+    gl_.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    gl_.UseProgram(draw_program_);
+    gl_.Uniform1i(u_.tex, 0);
+    batch_.reserve(65536);
+    return true;
+}
+
+GLuint GlBackend::compile(const char *vertex, const char *fragment) {
+    auto stage = [&](GLenum type, const char *source) -> GLuint {
+        const GLuint s = gl_.CreateShader(type);
+        gl_.ShaderSource(s, 1, &source, nullptr);
+        gl_.CompileShader(s);
+        GLint ok = 0;
+        gl_.GetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char log[2048];
+            gl_.GetShaderInfoLog(s, sizeof log, nullptr, log);
+            std::fprintf(stderr, "[gl] shader error: %s\n", log);
+            return 0;
+        }
+        return s;
+    };
+    const GLuint vs = stage(GL_VERTEX_SHADER, vertex), fs = stage(GL_FRAGMENT_SHADER, fragment);
+    if (vs == 0 || fs == 0) return 0;
+    const GLuint p = gl_.CreateProgram();
+    gl_.AttachShader(p, vs);
+    gl_.AttachShader(p, fs);
+    gl_.LinkProgram(p);
+    GLint ok = 0;
+    gl_.GetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[2048];
+        gl_.GetProgramInfoLog(p, sizeof log, nullptr, log);
+        std::fprintf(stderr, "[gl] link error: %s\n", log);
+        return 0;
+    }
+    return p;
+}
+
+// An RGBA8 pixel read from a render target, written in the target's own format (2 or 4 bytes).
+void pack_pixel(const std::uint8_t *p, std::uint32_t format, std::uint8_t *out) {
+    if (format == 3) {
+        std::memcpy(out, p, 4);
+        return;
+    }
+    std::uint16_t v;
+    if (format == 0) v = static_cast<std::uint16_t>((p[0] >> 3) | ((p[1] >> 2) << 5) | ((p[2] >> 3) << 11));
+    else if (format == 1) v = static_cast<std::uint16_t>((p[0] >> 3) | ((p[1] >> 3) << 5) | ((p[2] >> 3) << 10) | ((p[3] >> 7) << 15));
+    else v = static_cast<std::uint16_t>((p[0] >> 4) | ((p[1] >> 4) << 4) | ((p[2] >> 4) << 8) | ((p[3] >> 4) << 12));
+    std::memcpy(out, &v, 2);
+}
+
+// ---------------------------------------------------------------- render targets
+
+void GlBackend::allocate(RenderTarget &rt, std::uint32_t height) {
+    const GLsizei w = static_cast<GLsizei>(rt.width) * scale_, h = static_cast<GLsizei>(height) * scale_;
+    GLuint color = 0, depth = 0, fbo = 0;
+    gl_.GenTextures(1, &color);
+    gl_.BindTexture(GL_TEXTURE_2D, color);
+    gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    set_texture_params(true, true, true);
+    gl_.GenRenderbuffers(1, &depth);
+    gl_.BindRenderbuffer(GL_RENDERBUFFER, depth);
+    gl_.RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    gl_.GenFramebuffers(1, &fbo);
+    gl_.BindFramebuffer(GL_FRAMEBUFFER, fbo);
+    gl_.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+    gl_.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+    gl_.Disable(GL_SCISSOR_TEST);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.DepthMask(GL_TRUE);
+    gl_.ClearColor(0, 0, 0, 0);
+    gl_.Clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    if (rt.fbo != 0) {
+        // Keep what was drawn so far when a target grows.
+        gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, rt.fbo);
+        gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+        const GLsizei old_h = static_cast<GLsizei>(rt.height) * scale_;
+        gl_.BlitFramebuffer(0, 0, w, old_h, 0, 0, w, old_h, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        gl_.DeleteFramebuffers(1, &rt.fbo);
+        gl_.DeleteTextures(1, &rt.color);
+        gl_.DeleteRenderbuffers(1, &rt.depth);
+    }
+    rt.fbo = fbo;
+    rt.color = color;
+    rt.depth = depth;
+    rt.height = height;
+}
+
+GlBackend::RenderTarget &GlBackend::target_for(std::uint32_t address, std::uint32_t stride, std::uint32_t format,
+                                              std::uint32_t needed_height) {
+    stride = std::clamp<std::uint32_t>(stride, 1u, 1024u);
+    needed_height = std::clamp<std::uint32_t>(needed_height, 1u, 1024u);
+    auto it = targets_.find(address);
+    if (it != targets_.end() && (it->second.stride != stride || it->second.format != format)) {
+        auto &old = it->second;
+        gl_.DeleteFramebuffers(1, &old.fbo);
+        gl_.DeleteTextures(1, &old.color);
+        gl_.DeleteRenderbuffers(1, &old.depth);
+        targets_.erase(it);
+        it = targets_.end();
+    }
+    if (it == targets_.end()) {
+        RenderTarget rt;
+        rt.address = address;
+        rt.stride = stride;
+        rt.width = stride;
+        rt.format = format;
+        allocate(rt, std::max(needed_height, stride >= 480u ? 272u : std::min(stride, 512u)));
+        it = targets_.emplace(address, rt).first;
+        // Bound the number of live targets: drop the least recently used ones.
+        while (targets_.size() > 48) {
+            auto victim = targets_.end();
+            for (auto i = targets_.begin(); i != targets_.end(); ++i) {
+                if (i != it && (victim == targets_.end() || i->second.last_use < victim->second.last_use)) victim = i;
+            }
+            if (victim == targets_.end()) break;
+            gl_.DeleteFramebuffers(1, &victim->second.fbo);
+            gl_.DeleteTextures(1, &victim->second.color);
+            gl_.DeleteRenderbuffers(1, &victim->second.depth);
+            targets_.erase(victim);
+        }
+    } else if (needed_height > it->second.height) {
+        allocate(it->second, needed_height);
+    }
+    it->second.last_use = frame_;
+    return it->second;
+}
+
+GlBackend::RenderTarget *GlBackend::find_target(std::uint32_t vram_offset, bool drawn_only) {
+    RenderTarget *best = nullptr;
+    for (auto &[address, rt] : targets_) {
+        if (vram_offset >= rt.address && vram_offset < rt.end() && (!drawn_only || rt.last_draw != 0)) {
+            if (best == nullptr || rt.last_draw > best->last_draw) best = &rt;
+        }
+    }
+    return best;
+}
+
+// ---------------------------------------------------------------- state
+
+void GlBackend::set_texture_params(bool linear, bool clamp_s, bool clamp_t, bool mips) {
+    // Texture pack images carry mip levels: at a distance they are sampled from those, not shimmering.
+    const GLint min_filter = mips ? (linear ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR) : (linear ? GL_LINEAR : GL_NEAREST);
+    gl_.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter);
+    gl_.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    gl_.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, clamp_s ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    gl_.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, clamp_t ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+}
+
+GLuint GlBackend::texture_for(const gpu::Ge &ge, float uv_xform[4]) {
+    tex_mips_ = false;
+    tex_filter_ = 0;
+    seen_v_ = nullptr;
+    // The player turned the pack on or off: every texture is uploaded again, as the game's or as the pack's.
+    if (const bool want = pack_ != nullptr && live_->texture_pack.load(std::memory_order_relaxed); want != pack_on_) {
+        pack_on_ = want;
+        drop_textures();
+        if (!pack_on_) loader_->clear();
+    }
+    const auto info = ge.texture_info();
+    tex_width_ = static_cast<float>(info.width);
+    tex_height_ = static_cast<float>(info.height);
+    uv_xform[0] = 1.0f;
+    uv_xform[1] = 1.0f;
+    uv_xform[2] = 0.0f;
+    uv_xform[3] = 0.0f;
+    const bool indexed = info.format >= 4 && info.format <= 7;
+    if (indexed && (info.address & 0x0F000000u) == 0x04000000u && find_target(info.address & 0x001FFFFFu, true) != nullptr) {
+        // A palette texture over a framebuffer the GE drew is read from VRAM, which only holds the screen copy (late, and
+        // at the PSP's resolution). Named once per address, so an effect that looks wrong can be traced to it.
+        static std::set<std::uint32_t> reported;
+        if (reported.insert(info.address).second) {
+            std::fprintf(stderr, "[gl] palette texture read from a drawn framebuffer at %08X (format %u, %ux%u)\n", info.address,
+                         info.format, info.width, info.height);
+        }
+    }
+    // A texture inside a framebuffer the GE has drawn: sample the render target itself.
+    if ((info.address & 0x0F000000u) == 0x04000000u && !indexed) {
+        if (RenderTarget *rt = find_target(info.address & 0x001FFFFFu, true)) {
+            const std::uint32_t offset_pixels = ((info.address & 0x001FFFFFu) - rt->address) / rt->bytes_per_pixel();
+            const float ox = static_cast<float>(offset_pixels % rt->stride), oy = static_cast<float>(offset_pixels / rt->stride);
+            uv_xform[0] = tex_width_ / static_cast<float>(rt->width);
+            uv_xform[1] = tex_height_ / static_cast<float>(rt->height);
+            uv_xform[2] = ox / static_cast<float>(rt->width);
+            uv_xform[3] = oy / static_cast<float>(rt->height);
+            if (rt != current_) return rt->color;
+            // Reading the target being drawn: sample a copy.
+            const GLsizei w = static_cast<GLsizei>(rt->width) * scale_, h = static_cast<GLsizei>(rt->height) * scale_;
+            gl_.BindTexture(GL_TEXTURE_2D, copy_texture_);
+            if (copy_width_ != static_cast<std::uint32_t>(w) || copy_height_ != static_cast<std::uint32_t>(h)) {
+                gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                copy_width_ = static_cast<std::uint32_t>(w);
+                copy_height_ = static_cast<std::uint32_t>(h);
+            }
+            gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, copy_fbo_);
+            gl_.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, copy_texture_, 0);
+            gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
+            gl_.Disable(GL_SCISSOR_TEST);
+            gl_.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            gl_.BindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+            return copy_texture_;
+        }
+    }
+    // Decoded textures, cached by parameters and checked against their content once per frame.
+    std::uint64_t key = info.address;
+    key = key * 1315423911u ^ (static_cast<std::uint64_t>(info.format) << 40u) ^ (static_cast<std::uint64_t>(info.width) << 20u) ^
+          info.height ^ (static_cast<std::uint64_t>(info.stride) << 48u) ^ (info.swizzled ? 0x8000000000000000ull : 0u);
+    if (indexed) key ^= static_cast<std::uint64_t>(ge.reg(kClutFormat)) * 0x9E3779B97F4A7C15ull;
+    CachedTexture &t = textures_[key];
+    t.last_use = frame_;
+    const bool stale = t.texture == 0 || t.checked_frame != frame_ || (indexed && t.checked_clut != ge.clut_generation());
+    if (stale) {
+        const std::uint64_t hash = ge.texture_hash();
+        t.checked_frame = frame_;
+        t.checked_clut = ge.clut_generation();
+        // A 512-tall texture drawn lower than before has another pack key.
+        const bool rekey = pack_on_ && info.height == 512 && t.max_seen_v != t.keyed_max_v;
+        if (t.texture == 0 || hash != t.hash || rekey) {
+            t.hash = hash;
+            t.keyed_max_v = t.max_seen_v;
+            std::shared_ptr<const textures::Image> image;
+            bool kept = false;
+            if (pack_on_) {
+                look_up_pack(ge, info, t);
+                if (!t.pending.empty() && pack_images_.count(t.pending) != 0) {
+                    use_pack_image(t, t.pending); // on the GPU already: no decoding, no upload
+                    t.pending.clear();
+                    kept = true;
+                } else if (!t.pending.empty() && (pack_uploads_ >= kPackUploadsPerFlip ||
+                                                  loader_->get(t.pending, t.pending_files, image) != textures::Loader::State::Ready)) {
+                    image.reset();
+                }
+            }
+            if (kept) {
+            } else if (image) {
+                upload_pack_image(t, t.pending, *image);
+                loader_->forget(t.pending);
+                t.pending.clear();
+            } else {
+                // The game's own texture: until the pack's image is decoded, or for good.
+                pixels_.resize(static_cast<std::size_t>(info.width) * info.height);
+                ge.decode_texture(pixels_.data());
+                if (!dump_folder_.empty()) dump_texture(ge, info, pixels_.data());
+                if (!t.shown.empty() || interpolate_) release_texture(t); // a pack image's, or one a batch may replay
+                if (t.texture == 0) gl_.GenTextures(1, &t.texture);
+                t.mips = false;
+                gl_.BindTexture(GL_TEXTURE_2D, t.texture);
+                gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(info.width), static_cast<GLsizei>(info.height),
+                               0, GL_RGBA, GL_UNSIGNED_BYTE, pixels_.data());
+            }
+        }
+    }
+    // The pack's image arrived (the loader moves on only when one finished): it takes the game's texture's place.
+    if (!t.pending.empty() && pack_on_ && loader_->generation() != t.pending_generation && pack_uploads_ < kPackUploadsPerFlip) {
+        t.pending_generation = loader_->generation();
+        std::shared_ptr<const textures::Image> image;
+        const auto state = pack_images_.count(t.pending) != 0 ? textures::Loader::State::Ready : loader_->get(t.pending, t.pending_files, image);
+        if (state == textures::Loader::State::Ready) {
+            if (image) upload_pack_image(t, t.pending, *image);
+            else use_pack_image(t, t.pending); // another texture brought it to the GPU meanwhile
+            loader_->forget(t.pending);
+            t.pending.clear();
+        } else if (state == textures::Loader::State::Failed) {
+            t.pending.clear(); // the game's texture stays
+        }
+    }
+    uv_xform[0] = t.uv_scale[0];
+    uv_xform[1] = t.uv_scale[1];
+    tex_mips_ = t.mips;
+    tex_filter_ = t.filter;
+    if (pack_on_ && info.height == 512) seen_v_ = &t.max_seen_v;
+    return t.texture;
+}
+
+// ---------------------------------------------------------------- texture packs
+
+void GlBackend::open_texture_pack() {
+    pack_log_ = std::getenv("MHF_TEXTURE_LOG") != nullptr || std::getenv("MHF_TEXTURE_DEBUG") != nullptr; // the latter: PR #39's name
+    if (const char *mb = std::getenv("MHF_TEXTURE_PACK_MEMORY")) pack_budget_ = std::size_t(std::max(64L, std::atol(mb))) << 20;
+    std::string folder = live_->texture_pack_folder;
+    if (folder.empty()) {
+        if (const char *env = std::getenv("MHF_TEXTURE_PACK")) folder = env;
+    }
+    if (const char *dump = std::getenv("MHF_TEXTURE_DUMP")) {
+        dump_folder_ = textures::from_utf8(dump);
+        std::error_code ec;
+        std::filesystem::create_directories(dump_folder_, ec);
+    }
+    if (!folder.empty()) {
+        std::string error;
+        const std::filesystem::path chosen = textures::from_utf8(folder);
+        std::filesystem::path located = textures::Pack::locate(chosen, live_->texture_pack_game);
+        pack_ = textures::Pack::open(located.empty() ? chosen : located, live_->texture_pack_game, error);
+        if (!pack_) {
+            std::fprintf(stderr, "[textures] no texture pack: %s\n", error.c_str());
+        } else {
+            std::fprintf(stderr, "[textures] texture pack: %zu textures from %s\n", pack_->size(), textures::utf8(pack_->ini()).c_str());
+            for (const std::string &w : pack_->warnings()) std::fprintf(stderr, "[textures] %s\n", w.c_str());
+            const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+            loader_ = std::make_unique<textures::Loader>(std::clamp(cores / 3u, 1u, 3u));
+        }
+    }
+    // Dumps take their keys from the pack's options when there is a pack (so edited images fit in it), else from a
+    // new pack's: the quick hash, as PPSSPP writes them.
+    if (!dump_folder_.empty() && !pack_) {
+        std::error_code ec;
+        const std::filesystem::path ini = dump_folder_ / "textures.ini";
+        if (!std::filesystem::exists(ini, ec)) {
+            std::ofstream(ini, std::ios::binary) << "# Textures dumped by MHForever (MHF_TEXTURE_DUMP). Edit the images: their names are\n"
+                                                    "# their keys, so the folder is a texture pack as it is.\n"
+                                                    "[options]\nversion = 1\nhash = quick\n\n[hashes]\n";
+        }
+        dump_keys_ = textures::Pack::keys_only();
+    }
+}
+
+// The facts of the current texture a pack's key is made of.
+textures::TextureFacts texture_facts(const gpu::Ge &ge, const gpu::Ge::TextureInfo &info, std::uint16_t max_seen_v) {
+    textures::TextureFacts f;
+    f.address = info.address;
+    f.buffer_width = info.stride;
+    f.format = info.format;
+    f.width = info.width;
+    f.height = info.height;
+    f.dimension = static_cast<std::uint16_t>(ge.reg(kTexSize0) & 0x0F0Fu);
+    f.max_seen_v = max_seen_v;
+    f.clut_format_word = (kClutFormat << 24u) | (ge.reg(kClutFormat) & 0xFFFFFFu);
+    f.clut = ge.clut_bytes();
+    f.clut_last_bytes = ge.clut_last_bytes();
+    f.clut_max_bytes = ge.clut_max_bytes();
+    return f;
+}
+
+void GlBackend::look_up_pack(const gpu::Ge &ge, const gpu::Ge::TextureInfo &info, CachedTexture &t) {
+    t.pending.clear();
+    t.pending_files.clear();
+    t.pending_generation = ~0ull;
+    t.filter = 0;
+    t.uv_scale[0] = t.uv_scale[1] = 1.0f;
+    textures::Key key;
+    std::uint32_t covered_w = info.width, covered_h = info.height;
+    const auto memory = [&ge](std::uint32_t address, std::uint32_t size) { return ge.guest_bytes(address, size); };
+    if (!pack_->key_of(texture_facts(ge, info, t.max_seen_v), memory, key, covered_w, covered_h)) return;
+    const textures::Match m = pack_->find(key);
+    if (pack_log_) {
+        std::fprintf(stderr, "[textures] %s %ux%u format %u: %s\n", textures::format_key(key).c_str(), info.width, info.height,
+                     info.format, m.entry == nullptr ? "not in the pack" : m.entry->keeps_original() ? "kept" : m.entry->image().c_str());
+    }
+    if (m.entry == nullptr || m.entry->keeps_original()) {
+        ++pack_missed_;
+        return;
+    }
+    t.filter = m.filter == textures::Filter::Nearest ? 1 : m.filter == textures::Filter::Linear ? 2 : 0;
+    // A [hashranges] image covers only part of the texture: coordinates reach past it in the same proportion.
+    t.uv_scale[0] = static_cast<float>(info.width) / static_cast<float>(std::max(1u, covered_w));
+    t.uv_scale[1] = static_cast<float>(info.height) / static_cast<float>(std::max(1u, covered_h));
+    t.pending = m.entry->image();
+    for (const auto &[level, name] : m.entry->levels) t.pending_files.push_back(pack_->path_of(name));
+}
+
+// The cached texture lets go of its texture: its own is deleted (or retired, when a recorded batch may replay with it);
+// a pack image's stays with the image.
+void GlBackend::release_texture(CachedTexture &t) {
+    if (t.texture != 0 && t.shown.empty()) {
+        if (interpolate_) retired_textures_.emplace_back(frame_, t.texture);
+        else gl_.DeleteTextures(1, &t.texture);
+    }
+    t.texture = 0;
+    t.shown.clear();
+    t.mips = false;
+}
+
+void GlBackend::use_pack_image(CachedTexture &t, const std::string &name) {
+    PackImage &image = pack_images_.at(name);
+    if (t.shown != name) release_texture(t);
+    t.texture = image.texture;
+    t.shown = name;
+    t.mips = true;
+    image.last_use = frame_;
+    ++pack_reused_;
+}
+
+// Puts a decoded image on the GPU, once, with its mip levels, and draws the cached texture with it.
+void GlBackend::upload_pack_image(CachedTexture &t, const std::string &name, const textures::Image &image) {
+    if (pack_images_.count(name) == 0) {
+        GLuint texture = 0;
+        gl_.GenTextures(1, &texture);
+        gl_.BindTexture(GL_TEXTURE_2D, texture);
+        gl_.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        for (std::size_t level = 0; level < image.levels.size(); ++level) {
+            const auto w = static_cast<GLsizei>(std::max(1u, image.width >> level)), h = static_cast<GLsizei>(std::max(1u, image.height >> level));
+            gl_.TexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image.levels[level].data());
+        }
+        // An image without its own mip levels gets them made here; a full chain either way.
+        if (image.levels.size() == 1) gl_.GenerateMipmap(GL_TEXTURE_2D);
+        gl_.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, image.levels.size() == 1 ? 1000 : static_cast<GLint>(image.levels.size() - 1));
+        const std::size_t bytes = std::size_t(image.width) * image.height * 4u * 4u / 3u;
+        pack_images_[name] = PackImage{texture, bytes, frame_};
+        pack_bytes_ += bytes;
+        ++pack_replaced_;
+        ++pack_uploads_;
+    }
+    use_pack_image(t, name);
+    --pack_reused_; // counted as an upload, not a reuse
+}
+
+// The game's texture as a PNG named by its key, once: with a textures.ini next to them the folder is a pack (named
+// images are found without being listed), so editing an image replaces the texture.
+void GlBackend::dump_texture(const gpu::Ge &ge, const gpu::Ge::TextureInfo &info, const std::uint32_t *pixels) {
+    const textures::Pack *keys = pack_ ? pack_.get() : dump_keys_.get();
+    if (keys == nullptr) return;
+    textures::Key key;
+    std::uint32_t covered_w = 0, covered_h = 0;
+    const auto memory = [&ge](std::uint32_t address, std::uint32_t size) { return ge.guest_bytes(address, size); };
+    if (!keys->key_of(texture_facts(ge, info, 0), memory, key, covered_w, covered_h)) return;
+    const std::string name = textures::format_key(key);
+    if (!dumped_.insert(name).second) return;
+    std::error_code ec;
+    const std::filesystem::path file = dump_folder_ / (name + ".png");
+    if (std::filesystem::exists(file, ec)) return; // an image already edited is never written over
+    textures::write_png(file, info.width, info.height, pixels);
+}
+
+// Every cached texture uploaded again at its next use (the pack was turned on or off).
+void GlBackend::drop_textures() {
+    for (auto &[key, t] : textures_) release_texture(t);
+    textures_.clear();
+    for (auto &[name, image] : pack_images_) {
+        if (interpolate_) retired_textures_.emplace_back(frame_, image.texture);
+        else gl_.DeleteTextures(1, &image.texture);
+    }
+    pack_images_.clear();
+    pack_bytes_ = 0;
+    seen_v_ = nullptr;
+}
+
+// Pack images go when nothing drew with them for a while, or, past the budget, those drawn least recently (not in this
+// flip or the one before); the cached textures drawn with them are made again, as the game's first, when next drawn.
+void GlBackend::trim_pack_memory() {
+    const bool over = pack_bytes_ > pack_budget_;
+    if (!over && (frame_ & 255u) != 0) return;
+    for (const auto &[key, t] : textures_) { // an image is in use while a cached texture draws with it
+        if (!t.shown.empty()) {
+            if (const auto it = pack_images_.find(t.shown); it != pack_images_.end()) it->second.last_use = std::max(it->second.last_use, t.last_use);
+        }
+    }
+    std::vector<std::pair<std::uint64_t, std::string>> by_age;
+    for (const auto &[name, image] : pack_images_) {
+        if (image.last_use + 600 < frame_ || (over && image.last_use + 1 < frame_)) by_age.emplace_back(image.last_use, name);
+    }
+    std::sort(by_age.begin(), by_age.end());
+    const std::size_t goal = pack_budget_ / 10u * 9u;
+    std::set<std::string> gone;
+    for (const auto &[use, name] : by_age) {
+        if (use + 600 >= frame_ && pack_bytes_ <= goal) break;
+        const auto it = pack_images_.find(name);
+        pack_bytes_ -= std::min(pack_bytes_, it->second.bytes);
+        if (interpolate_) retired_textures_.emplace_back(frame_, it->second.texture);
+        else gl_.DeleteTextures(1, &it->second.texture);
+        pack_images_.erase(it);
+        gone.insert(name);
+    }
+    if (gone.empty()) return;
+    for (auto i = textures_.begin(); i != textures_.end();) {
+        if (gone.count(i->second.shown) != 0) i = textures_.erase(i);
+        else ++i;
+    }
+}
+
+GLenum blend_factor(std::uint32_t f, bool source_side, std::uint32_t fixed, bool &uses_constant) {
+    switch (f) {
+    case 0: return source_side ? GL_DST_COLOR : GL_SRC_COLOR;
+    case 1: return source_side ? GL_ONE_MINUS_DST_COLOR : GL_ONE_MINUS_SRC_COLOR;
+    case 2: return GL_SRC_ALPHA;
+    case 3: return GL_ONE_MINUS_SRC_ALPHA;
+    case 4: return GL_DST_ALPHA;
+    case 5: return GL_ONE_MINUS_DST_ALPHA;
+    case 6: return GL_SRC_ALPHA;           // 2 * src alpha: approximated
+    case 7: return GL_ONE_MINUS_SRC_ALPHA; // 1 - 2 * src alpha: approximated
+    case 8: return GL_DST_ALPHA;
+    case 9: return GL_ONE_MINUS_DST_ALPHA;
+    default:
+        if ((fixed & 0xFFFFFFu) == 0xFFFFFFu) return GL_ONE;
+        if ((fixed & 0xFFFFFFu) == 0) return GL_ZERO;
+        uses_constant = true;
+        return GL_CONSTANT_COLOR;
+    }
+}
+
+void GlBackend::apply_state(const gpu::Ge &ge) {
+    DrawSetup setup;
+    setup.key = state_key_;
+    const std::uint32_t fb = ge.reg(kFramebufPtr) & 0x1FFFF0u;
+    const std::uint32_t stride = ge.reg(kFramebufWidth) & 0x7FCu;
+    const std::uint32_t format = ge.reg(kFramebufPixFormat) & 3u;
+    const std::uint32_t sy2 = (ge.reg(kScissor2) >> 10u) & 0x3FFu;
+    RenderTarget &rt = target_for(fb, stride == 0 ? 512u : stride, format, sy2 + 1u);
+    current_ = &rt;
+    rt.last_draw = frame_;
+    through_ = (ge.reg(kVertexType) & (1u << 23u)) != 0;
+    setup.through = through_;
+    setup.target = rt.address;
+
+    // Texture (may blit, so before the target is bound).
+    const bool clear = (ge.reg(kClearMode) & 1u) != 0;
+    const bool textured = !clear && (ge.reg(kTextureMapEnable) & 1u) != 0;
+    tex_width_ = tex_height_ = 1.0f;
+    seen_v_ = nullptr; // untextured draws say nothing of the last texture's rows
+    tex_mips_ = false;
+    tex_filter_ = 0;
+    if (textured) {
+        gl_.ActiveTexture(GL_TEXTURE0);
+        setup.texture = texture_for(ge, setup.uv_xform);
+        setup.self_sampled = setup.texture == copy_texture_;
+        setup.texture_mips = tex_mips_;
+        setup.texture_filter = tex_filter_;
+    }
+    setup.tex_width = tex_width_;
+    setup.tex_height = tex_height_;
+    setup_ = setup;
+    emit_state(setup, rt);
+}
+
+void GlBackend::emit_state(const DrawSetup &setup, RenderTarget &rt) {
+    const auto R = [&](std::uint32_t reg) { return key_reg(setup.key, reg); };
+    const std::uint32_t sx1 = R(kScissor1) & 0x3FFu, sy1 = (R(kScissor1) >> 10u) & 0x3FFu;
+    const std::uint32_t sx2 = R(kScissor2) & 0x3FFu, sy2 = (R(kScissor2) >> 10u) & 0x3FFu;
+    const bool through = setup.through;
+    const float *uv_xform = setup.uv_xform;
+
+    gl_.UseProgram(draw_program_);
+    gl_.BindVertexArray(vao_);
+
+    const bool clear = (R(kClearMode) & 1u) != 0;
+    const bool textured = !clear && (R(kTextureMapEnable) & 1u) != 0;
+    if (textured) {
+        gl_.ActiveTexture(GL_TEXTURE0);
+        gl_.BindTexture(GL_TEXTURE_2D, setup.texture);
+        // Enhancement (off by default): bilinear filtering for 3D textures; 2D (through-mode) art stays as drawn.
+        bool linear = (R(kTexFilter) & 0x100u) != 0 || (live_->smooth_textures.load(std::memory_order_relaxed) && !through);
+        if (setup.texture_filter != 0) linear = setup.texture_filter == 2; // a texture pack's [filtering]
+        set_texture_params(linear, (R(kTexWrap) & 1u) != 0, (R(kTexWrap) & 0x100u) != 0, setup.texture_mips);
+    }
+
+    gl_.BindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
+    gl_.Viewport(0, 0, static_cast<GLsizei>(rt.width) * scale_, static_cast<GLsizei>(rt.height) * scale_);
+    gl_.Enable(GL_SCISSOR_TEST);
+    const std::uint32_t x2 = std::min(sx2, rt.width - 1u), y2 = std::min(sy2, rt.height - 1u);
+    if (sx1 > x2 || sy1 > y2) {
+        gl_.Scissor(0, 0, 0, 0);
+    } else {
+        gl_.Scissor(static_cast<GLint>(sx1) * scale_, static_cast<GLint>(sy1) * scale_,
+                    static_cast<GLsizei>(x2 - sx1 + 1u) * scale_, static_cast<GLsizei>(y2 - sy1 + 1u) * scale_);
+    }
+
+    gl_.Uniform2f(u_.target, static_cast<float>(rt.width), static_cast<float>(rt.height));
+    gl_.Uniform4f(u_.uv_xform, uv_xform[0], uv_xform[1], uv_xform[2], uv_xform[3]);
+    gl_.Uniform1i(u_.clear, clear ? 1 : 0);
+    gl_.Uniform1i(u_.tex_enable, textured ? 1 : 0);
+
+    if (clear) {
+        const std::uint32_t cm = R(kClearMode);
+        const bool rgb = (cm & 0x100u) != 0, alpha = (cm & 0x200u) != 0, depth = (cm & 0x400u) != 0;
+        gl_.Disable(GL_BLEND);
+        gl_.ColorMask(rgb, rgb, rgb, alpha);
+        gl_.Enable(GL_DEPTH_TEST);
+        gl_.DepthFunc(GL_ALWAYS);
+        gl_.DepthMask(depth ? GL_TRUE : GL_FALSE);
+        gl_.Uniform1i(u_.alpha_func, 1);
+        gl_.Uniform1i(u_.zrange_enable, 0);
+        return;
+    }
+
+    const std::uint32_t func = R(kTexFunc);
+    gl_.Uniform1i(u_.tex_func, static_cast<GLint>(func & 7u));
+    gl_.Uniform1i(u_.tex_rgba, (func & 0x100u) != 0 ? 1 : 0);
+    gl_.Uniform1i(u_.tex_double, (func & 0x10000u) != 0 ? 1 : 0);
+    float env[3];
+    unpack_rgb(R(kTexEnvColor), env);
+    gl_.Uniform3f(u_.env, env[0], env[1], env[2]);
+    const bool fog = !through && (R(kFogEnable) & 1u) != 0;
+    gl_.Uniform1i(u_.fog_enable, fog ? 1 : 0);
+    float fog_color[3];
+    unpack_rgb(R(kFogColor), fog_color);
+    gl_.Uniform3f(u_.fog_color, fog_color[0], fog_color[1], fog_color[2]);
+
+    if ((R(kAlphaTestEnable) & 1u) != 0) {
+        const std::uint32_t at = R(kAlphaTest);
+        gl_.Uniform1i(u_.alpha_func, static_cast<GLint>(at & 7u));
+        gl_.Uniform1i(u_.alpha_ref, static_cast<GLint>((at >> 8u) & 0xFFu));
+        gl_.Uniform1i(u_.alpha_mask, static_cast<GLint>((at >> 16u) & 0xFFu));
+    } else {
+        gl_.Uniform1i(u_.alpha_func, 1);
+    }
+    const std::uint32_t minz = R(kMinZ) & 0xFFFFu, maxz = R(kMaxZ) & 0xFFFFu;
+    const bool zrange = !through && maxz != 0 && (minz != 0 || maxz != 0xFFFFu);
+    gl_.Uniform1i(u_.zrange_enable, zrange ? 1 : 0);
+    gl_.Uniform2f(u_.zrange, static_cast<float>(minz), static_cast<float>(maxz));
+
+    // Depth.
+    if ((R(kZTestEnable) & 1u) != 0) {
+        static constexpr GLenum funcs[8] = {GL_NEVER, GL_ALWAYS, GL_EQUAL, GL_NOTEQUAL, GL_LESS, GL_LEQUAL, GL_GREATER, GL_GEQUAL};
+        gl_.Enable(GL_DEPTH_TEST);
+        gl_.DepthFunc(funcs[R(kZTest) & 7u]);
+        gl_.DepthMask((R(kZWriteDisable) & 1u) == 0 ? GL_TRUE : GL_FALSE);
+    } else {
+        gl_.Disable(GL_DEPTH_TEST);
+        gl_.DepthMask(GL_FALSE);
+    }
+
+    // Blending.
+    if ((R(kAlphaBlendEnable) & 1u) != 0) {
+        const std::uint32_t mode = R(kBlendMode);
+        bool constant_a = false, constant_b = false;
+        const std::uint32_t fix_a = R(kBlendFixedA), fix_b = R(kBlendFixedB);
+        const GLenum src = blend_factor(mode & 0xFu, true, fix_a, constant_a);
+        GLenum dst = blend_factor((mode >> 4u) & 0xFu, false, fix_b, constant_b);
+        std::uint32_t constant = constant_a ? fix_a : fix_b;
+        if (constant_a && constant_b && (fix_a & 0xFFFFFFu) != (fix_b & 0xFFFFFFu)) {
+            // One constant color only: B = 1 - A is the usual case.
+            dst = GL_ONE_MINUS_CONSTANT_COLOR;
+            constant = fix_a;
+        }
+        if (constant_a || constant_b) {
+            float c[3];
+            unpack_rgb(constant, c);
+            gl_.BlendColor(c[0], c[1], c[2], 1.0f);
+        }
+        static constexpr GLenum equations[6] = {GL_FUNC_ADD, GL_FUNC_SUBTRACT, GL_FUNC_REVERSE_SUBTRACT, GL_MIN, GL_MAX, GL_MAX};
+        const std::uint32_t eq = std::min<std::uint32_t>((mode >> 8u) & 0xFu, 5u);
+        gl_.Enable(GL_BLEND);
+        gl_.BlendEquationSeparate(equations[eq], GL_FUNC_ADD);
+        gl_.BlendFuncSeparate(src, dst, GL_ONE, GL_ZERO);
+    } else {
+        gl_.Disable(GL_BLEND);
+    }
+
+    // Write masks (a channel is written unless every bit of it is masked).
+    const std::uint32_t mask = R(kMaskRgb);
+    const bool keep_alpha = (R(kStencilTestEnable) & 1u) != 0 || (R(kMaskAlpha) & 0xFFu) == 0xFFu;
+    gl_.ColorMask((mask & 0xFFu) != 0xFFu, ((mask >> 8u) & 0xFFu) != 0xFFu, ((mask >> 16u) & 0xFFu) != 0xFFu, !keep_alpha);
+}
+
+void GlBackend::flush() {
+    draw_batch();
+    // Testing aid: MHF_GL_READBACK=1 copies drawn targets back into guest VRAM after every list, so that tests that
+    // read pixels (homebrew/getest) can check the hardware renderer too.
+    static const bool readback = [] {
+        const char *v = std::getenv("MHF_GL_READBACK");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (readback) read_back();
+}
+
+void GlBackend::read_back() {
+    std::vector<std::uint8_t> rgba;
+    for (auto &[address, rt] : targets_) {
+        if (rt.last_draw != frame_) continue;
+        const GLsizei w = static_cast<GLsizei>(rt.width) * scale_, h = static_cast<GLsizei>(rt.height) * scale_;
+        rgba.resize(static_cast<std::size_t>(w) * h * 4u);
+        gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, rt.fbo);
+        gl_.PixelStorei(GL_PACK_ALIGNMENT, 1);
+        gl_.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        const std::uint32_t bpp = rt.bytes_per_pixel();
+        for (std::uint32_t y = 0; y < rt.height; ++y) {
+            std::uint8_t *row = memory_.raw_pointer(0x04000000u + rt.address + y * rt.stride * bpp, rt.width * bpp);
+            if (row == nullptr) continue;
+            for (std::uint32_t x = 0; x < rt.width; ++x) {
+                const std::uint8_t *p = rgba.data() + (static_cast<std::size_t>(y) * scale_ * w + static_cast<std::size_t>(x) * scale_) * 4u;
+                pack_pixel(p, rt.format, row + x * bpp);
+            }
+        }
+    }
+    have_state_ = false;
+}
+
+void GlBackend::draw_batch() {
+    if (batch_.empty() && raw_batch_.empty()) return;
+    if (interpolate_) {
+        if (tape_.size() >= 20000) { // a game that never flips: do not keep everything
+            tape_.clear();
+            touched_.insert(~0u);
+        }
+        // A batch culled whole in this flip is kept for its triangles before clipping: in between it may show.
+        tape_.push_back({setup_, batch_, batch_origins_, std::move(raw_batch_), raw_complete_});
+    }
+    if (!batch_.empty()) draw_vertices(batch_);
+    batch_.clear();
+    batch_origins_.clear();
+    raw_batch_.clear();
+    raw_complete_ = true;
+}
+
+void GlBackend::draw_vertices(const std::vector<GpuVertex> &vertices) {
+    gl_.BindBuffer(GL_ARRAY_BUFFER, vbo_);
+    gl_.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(GpuVertex)), vertices.data(),
+                   GL_STREAM_DRAW);
+    gl_.DrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
+}
+
+// ---------------------------------------------------------------- transfers and presentation
+
+void GlBackend::upload_rect(RenderTarget &rt, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h) {
+    const std::uint32_t bpp = rt.bytes_per_pixel();
+    pixels_.resize(static_cast<std::size_t>(w) * h);
+    for (std::uint32_t row = 0; row < h; ++row) {
+        const std::uint32_t address = 0x04000000u + rt.address + ((y + row) * rt.stride + x) * bpp;
+        const std::uint8_t *p = memory_.raw_pointer(address, w * bpp);
+        for (std::uint32_t col = 0; col < w; ++col) {
+            pixels_[static_cast<std::size_t>(row) * w + col] = p != nullptr ? framebuffer_pixel(p + col * bpp, rt.format) : 0u;
+        }
+    }
+    gl_.BindTexture(GL_TEXTURE_2D, upload_texture_);
+    gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
+                   GL_UNSIGNED_BYTE, pixels_.data());
+    set_texture_params(false, true, true);
+    gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, copy_fbo_);
+    gl_.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, upload_texture_, 0);
+    gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, rt.fbo);
+    gl_.Disable(GL_SCISSOR_TEST);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.BlitFramebuffer(0, 0, static_cast<GLint>(w), static_cast<GLint>(h), static_cast<GLint>(x) * scale_,
+                        static_cast<GLint>(y) * scale_, static_cast<GLint>(x + w) * scale_, static_cast<GLint>(y + h) * scale_,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
+
+// A rectangle of a render target written into guest RAM at the PSP's resolution, in the target's format: each PSP pixel is
+// the average of the scale x scale pixels drawn for it.
+void GlBackend::copy_to_ram(RenderTarget &from, std::uint32_t src, std::uint32_t sx, std::uint32_t sy, std::uint32_t dst,
+                            std::uint32_t dst_stride, std::uint32_t dx, std::uint32_t dy, std::uint32_t width,
+                            std::uint32_t height) {
+    const std::uint32_t bpp = from.bytes_per_pixel();
+    const std::uint32_t src_offset = ((src & 0x001FFFFFu) - from.address) / bpp;
+    const std::uint32_t fx = src_offset % from.stride + sx, fy = src_offset / from.stride + sy;
+    if (fx >= from.width || fy >= from.height) return;
+    width = std::min(width, from.width - fx);
+    height = std::min(height, from.height - fy);
+    const std::uint32_t s = static_cast<std::uint32_t>(scale_);
+    const std::uint32_t w = width * s, h = height * s;
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4u);
+    gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, from.fbo);
+    gl_.PixelStorei(GL_PACK_ALIGNMENT, 1);
+    gl_.ReadPixels(static_cast<GLint>(fx * s), static_cast<GLint>(fy * s), static_cast<GLsizei>(w), static_cast<GLsizei>(h),
+                   GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    const std::uint32_t samples = s * s;
+    for (std::uint32_t y = 0; y < height; ++y) {
+        std::uint8_t *row = memory_.raw_pointer(dst + ((dy + y) * dst_stride + dx) * bpp, width * bpp);
+        if (row == nullptr) continue;
+        for (std::uint32_t x = 0; x < width; ++x) {
+            std::uint32_t sum[4]{};
+            for (std::uint32_t j = 0; j < s; ++j) {
+                const std::uint8_t *p = rgba.data() + ((static_cast<std::size_t>(y) * s + j) * w + static_cast<std::size_t>(x) * s) * 4u;
+                for (std::uint32_t i = 0; i < s; ++i, p += 4) {
+                    for (int c = 0; c < 4; ++c) sum[c] += p[c];
+                }
+            }
+            const std::uint8_t pixel[4] = {static_cast<std::uint8_t>(sum[0] / samples), static_cast<std::uint8_t>(sum[1] / samples),
+                                           static_cast<std::uint8_t>(sum[2] / samples), static_cast<std::uint8_t>(sum[3] / samples)};
+            pack_pixel(pixel, from.format, row + x * bpp);
+        }
+    }
+}
+
+void GlBackend::block_transfer(std::uint32_t src, std::uint32_t /*src_stride: the target's own*/, std::uint32_t sx, std::uint32_t sy,
+                               std::uint32_t dst, std::uint32_t dst_stride, std::uint32_t dx, std::uint32_t dy,
+                               std::uint32_t width, std::uint32_t height, std::uint32_t bpp) {
+    draw_batch();
+    have_state_ = false; // GL state is changed below
+    const bool src_vram = (src & 0x0F000000u) == 0x04000000u, dst_vram = (dst & 0x0F000000u) == 0x04000000u;
+    RenderTarget *from = src_vram ? find_target(src & 0x001FFFFFu, true) : nullptr;
+    if (!dst_vram) {
+        // Into RAM: the GE already copied the bytes, but out of a framebuffer it has drawn they are stale, since the
+        // picture only lives in the render target. Read that part back (the quest-end screen keeps a copy of the last
+        // hunting picture this way and showed black).
+        if (from != nullptr && from->bytes_per_pixel() == bpp) copy_to_ram(*from, src, sx, sy, dst, dst_stride, dx, dy, width, height);
+        return;
+    }
+    const std::uint32_t format = bpp == 4 ? 3u : 1u;
+    if (from != nullptr && from->bytes_per_pixel() == bpp) {
+        // Framebuffer to framebuffer (or to a texture area): copy on the GPU at full resolution.
+        const std::uint32_t src_offset = ((src & 0x001FFFFFu) - from->address) / bpp;
+        const std::uint32_t fx = src_offset % from->stride + sx, fy = src_offset / from->stride + sy;
+        RenderTarget &to = target_for(dst & 0x001FFFF0u, dst_stride, format, dy + height);
+        to.last_draw = frame_;
+        touched_.insert(to.address);
+        gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, from->fbo);
+        gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, to.fbo);
+        gl_.Disable(GL_SCISSOR_TEST);
+        gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        const GLint s = scale_;
+        if (from == &to) {
+            // Source and destination in one target: copy the source out first (overlapping blits are undefined).
+            const GLsizei w = static_cast<GLsizei>(from->width) * s, h = static_cast<GLsizei>(from->height) * s;
+            gl_.BindTexture(GL_TEXTURE_2D, copy_texture_);
+            if (copy_width_ != static_cast<std::uint32_t>(w) || copy_height_ != static_cast<std::uint32_t>(h)) {
+                gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                copy_width_ = static_cast<std::uint32_t>(w);
+                copy_height_ = static_cast<std::uint32_t>(h);
+            }
+            gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, copy_fbo_);
+            gl_.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, copy_texture_, 0);
+            gl_.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, copy_fbo_);
+            gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, to.fbo);
+        }
+        gl_.BlitFramebuffer(static_cast<GLint>(fx) * s, static_cast<GLint>(fy) * s, static_cast<GLint>(fx + width) * s,
+                            static_cast<GLint>(fy + height) * s, static_cast<GLint>(dx) * s, static_cast<GLint>(dy) * s,
+                            static_cast<GLint>(dx + width) * s, static_cast<GLint>(dy + height) * s, GL_COLOR_BUFFER_BIT,
+                            GL_NEAREST);
+        return;
+    }
+    // CPU-made pixels copied into a framebuffer the GE draws to: bring them into the render target.
+    if (RenderTarget *to = find_target(dst & 0x001FFFFFu, true)) {
+        touched_.insert(to->address);
+        const std::uint32_t offset = ((dst & 0x001FFFFFu) - to->address) / to->bytes_per_pixel();
+        upload_rect(*to, offset % to->stride + dx, offset / to->stride + dy, width, height);
+    }
+}
+
+void GlBackend::present(std::uint32_t address, std::uint32_t stride, std::uint32_t pixel_format) {
+    draw_batch();
+    have_state_ = false;
+    flush_pictures(); // pictures of the previous flip that never got their turn
+    apply_live_scale();
+    const std::uint32_t offset = address & 0x001FFFFFu;
+    GLuint texture = 0;
+    float uv_max[2] = {1, 1};
+    RenderTarget *drawn = nullptr;
+    const auto it = targets_.find(offset);
+    // A target the GE drew since the last flip (or the one before) shows what the game rendered; otherwise the CPU
+    // made this screen (movies, loading screens), so show guest memory.
+    if (it != targets_.end() && it->second.last_draw + 1 >= frame_) {
+        drawn = &it->second;
+        texture = it->second.color;
+        uv_max[0] = 480.0f / static_cast<float>(it->second.width);
+        uv_max[1] = 272.0f / static_cast<float>(it->second.height);
+    } else {
+        // The CPU made this screen, so it is whatever the game wrote: the framebuffer in VRAM (`0x04xxxxxx` memory,
+        // the usual case), or an address of the game's own that it flips `sceDisplaySetFrameBuf` between, which is
+        // where the movie player draws its pictures (the GE never touches those).
+        const std::uint32_t bpp = pixel_format == 3 ? 4u : 2u;
+        const std::uint32_t minimum_stride = (address & 0x0F000000u) == 0x04000000u || (address & 0x0F000000u) == 0x08000000u
+                                                 ? 480u
+                                                 : 512u;
+        stride = std::max(stride, minimum_stride);
+        const std::size_t needed = static_cast<std::size_t>(stride) * 271u * bpp + 480u * bpp;
+        if (memory_.contains(address, needed)) {
+            pixels_.resize(480u * 272u);
+            const std::uint8_t *base = memory_.raw_pointer(address, needed);
+            for (std::uint32_t y = 0; y < 272; ++y) {
+                for (std::uint32_t x = 0; x < 480; ++x) {
+                    pixels_[y * 480u + x] = framebuffer_pixel(base + (y * stride + x) * bpp, pixel_format);
+                }
+            }
+            gl_.BindTexture(GL_TEXTURE_2D, display_texture_);
+            gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 480, 272, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels_.data());
+            texture = display_texture_;
+        }
+    }
+
+    if (interpolate_) {
+        if (drawn == nullptr || !present_interpolated(*drawn, uv_max)) show(texture, uv_max[0], uv_max[1]);
+        if (drawn == nullptr) previous_valid_ = false;
+    } else {
+        show(texture, uv_max[0], uv_max[1]);
+    }
+    copy_shown_to_vram(drawn);
+    finish_flip();
+    apply_live_fps(); // after the flip: the next one is the first recorded for the new rate
+}
+
+// Some games read the picture on screen with the CPU: Freedom Unite turns the last hunting picture into the background
+// of the quest rewards that way. The GE draws into render targets at the internal resolution and never into guest
+// VRAM, so the picture shown at each flip is also copied back into its framebuffer at the PSP's 480x272. It is read
+// back through a pixel buffer once the GPU has finished with it (a fence says when), so drawing never waits for it. Each
+// framebuffer is copied every fourth flip at most, which keeps the cost low on a slow GPU; a game reading the screen
+// finds a picture from a few flips before (a tenth of a second or so), which is what was on display.
+void GlBackend::copy_shown_to_vram(RenderTarget *shown) {
+    constexpr std::uint32_t kWidth = 480, kHeight = 272;
+    if (pending_readback_.active) {
+        // Not read back yet (a slow GPU, or a software one): try again at the next flip rather than wait here.
+        if (gl_.ClientWaitSync(pending_readback_.fence, 0, 0) == GL_TIMEOUT_EXPIRED) return;
+        gl_.DeleteSync(pending_readback_.fence);
+        const PendingReadback p = pending_readback_;
+        pending_readback_.active = false;
+        gl_.BindBuffer(GL_PIXEL_PACK_BUFFER, readback_pbo_);
+        const auto *rgba = static_cast<const std::uint8_t *>(
+            gl_.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, static_cast<GLsizeiptr>(kWidth * kHeight * 4u), GL_MAP_READ_BIT));
+        if (rgba != nullptr) {
+            const std::uint32_t bpp = p.format == 3 ? 4u : 2u;
+            for (std::uint32_t y = 0; y < p.height; ++y) {
+                std::uint8_t *row = memory_.raw_pointer(0x04000000u + p.address + y * p.stride * bpp, p.width * bpp);
+                if (row == nullptr) continue;
+                const std::uint8_t *line = rgba + static_cast<std::size_t>(y) * p.width * 4u;
+                if (p.format == 3) {
+                    std::memcpy(row, line, p.width * 4u); // the same bytes as RGBA8
+                    continue;
+                }
+                for (std::uint32_t x = 0; x < p.width; ++x) pack_pixel(line + x * 4u, p.format, row + x * bpp);
+            }
+            gl_.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        }
+        gl_.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    }
+    // Each framebuffer is copied at most every fourth flip. Counting flips instead would copy only one framebuffer of a
+    // double-buffered game (they take turns), and the game would read the other one black.
+    if (shown == nullptr || (shown->copied != 0 && frame_ + 1 - shown->copied < 4)) return;
+    shown->copied = frame_ + 1;
+    if (readback_fbo_ == 0) {
+        gl_.GenTextures(1, &readback_texture_);
+        gl_.BindTexture(GL_TEXTURE_2D, readback_texture_);
+        gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kWidth, kHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        gl_.GenFramebuffers(1, &readback_fbo_);
+        gl_.BindFramebuffer(GL_FRAMEBUFFER, readback_fbo_);
+        gl_.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, readback_texture_, 0);
+        gl_.GenBuffers(1, &readback_pbo_);
+        gl_.BindBuffer(GL_PIXEL_PACK_BUFFER, readback_pbo_);
+        gl_.BufferData(GL_PIXEL_PACK_BUFFER, static_cast<GLsizeiptr>(kWidth * kHeight * 4u), nullptr, GL_STREAM_READ);
+        gl_.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    }
+    const std::uint32_t width = std::min(kWidth, shown->width), height = std::min(kHeight, shown->height);
+    const GLint s = scale_;
+    gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, shown->fbo);
+    gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, readback_fbo_);
+    gl_.Disable(GL_SCISSOR_TEST);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.BlitFramebuffer(0, 0, static_cast<GLint>(width) * s, static_cast<GLint>(height) * s, 0, 0, static_cast<GLint>(width),
+                        static_cast<GLint>(height), GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, readback_fbo_);
+    gl_.BindBuffer(GL_PIXEL_PACK_BUFFER, readback_pbo_);
+    gl_.PixelStorei(GL_PACK_ALIGNMENT, 1);
+    gl_.ReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    gl_.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    pending_readback_ = {true, gl_.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0), shown->address, shown->stride, shown->format, width,
+                         height};
+    have_state_ = false;
+}
+
+// Puts a picture on the window: letterboxed to the PSP's 480:272, with the dialog overlay on top.
+void GlBackend::show(GLuint texture, float uv_max_x, float uv_max_y) {
+    const auto show_start = std::chrono::steady_clock::now();
+    last_texture_ = texture;
+    last_uv_[0] = uv_max_x;
+    last_uv_[1] = uv_max_y;
+    last_show_ = show_start;
+    int window_w = 0, window_h = 0;
+    SDL_GetWindowSizeInPixels(window_, &window_w, &window_h);
+    gl_.BindFramebuffer(GL_FRAMEBUFFER, 0);
+    gl_.Disable(GL_SCISSOR_TEST);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.Viewport(0, 0, window_w, window_h);
+    gl_.ClearColor(0, 0, 0, 1);
+    gl_.Clear(GL_COLOR_BUFFER_BIT);
+    bool menu = false;
+    if (overlay_ != nullptr) {
+        std::lock_guard lock(overlay_->mutex);
+        menu = overlay_->continuous;
+    }
+    if (menu && texture != 0 && window_w > 0 && window_h > 0) {
+        // The menu is open: the whole window shows the game running behind it, blurred and darkened.
+        if (!blur_ready_ || blur_source_ != texture || !redraw_only_) build_blur(texture, uv_max_x, uv_max_y);
+        draw_blurred_background(window_w, window_h);
+        have_state_ = false;
+    } else if (texture != 0 && window_w > 0 && window_h > 0) {
+        blur_ready_ = false;
+        int w = window_w, h = window_w * 272 / 480;
+        if (h > window_h) {
+            h = window_h;
+            w = window_h * 480 / 272;
+        }
+        gl_.Viewport((window_w - w) / 2, (window_h - h) / 2, w, h);
+        gl_.Disable(GL_DEPTH_TEST);
+        gl_.Disable(GL_BLEND);
+        gl_.UseProgram(present_program_);
+        gl_.Uniform1i(present_tex_, 0);
+        gl_.Uniform2f(present_uv_max_, uv_max_x, uv_max_y);
+        gl_.ActiveTexture(GL_TEXTURE0);
+        gl_.BindTexture(GL_TEXTURE_2D, texture);
+        set_texture_params(true, true, true);
+        gl_.BindVertexArray(empty_vao_);
+        gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    if (window_w > 0 && window_h > 0) {
+        int w = window_w, h = window_w * 272 / 480;
+        if (h > window_h) {
+            h = window_h;
+            w = window_h * 480 / 272;
+        }
+        gl_.Viewport((window_w - w) / 2, (window_h - h) / 2, w, h);
+        draw_overlay();
+    }
+    dump_window(window_w, window_h);
+    const auto swap_start = std::chrono::steady_clock::now();
+    SDL_GL_SwapWindow(window_);
+    const auto swap_end = std::chrono::steady_clock::now();
+    cost_.swap_us += std::chrono::duration<double, std::micro>(swap_end - swap_start).count();
+    cost_.show_us += std::chrono::duration<double, std::micro>(swap_end - show_start).count();
+    ++cost_.shows;
+    ++shown_;
+}
+
+void GlBackend::finish_flip() {
+    ++frame_;
+    tape_.clear();
+    touched_.clear();
+    cameras_.clear();
+    camera_ = kNoCamera;
+    draw_uses_.clear();
+    for (auto i = retired_textures_.begin(); i != retired_textures_.end();) {
+        if (i->first + 4 < frame_) {
+            gl_.DeleteTextures(1, &i->second);
+            i = retired_textures_.erase(i);
+        } else {
+            ++i;
+        }
+    }
+
+    seen_v_ = nullptr;
+    pack_uploads_ = 0;
+    trim_pack_memory();
+    if (pack_log_ && loader_ && frame_ >= pack_logged_at_ + 300) {
+        pack_logged_at_ = frame_;
+        const auto c = loader_->counters();
+        std::fprintf(stderr, "[textures] %llu images on the GPU (%zu now, %llu reused), %llu not in the pack; %llu images decoded (%.1f ms each), %llu failed; %zu MB on the GPU\n",
+                     static_cast<unsigned long long>(pack_replaced_), pack_images_.size(), static_cast<unsigned long long>(pack_reused_),
+                     static_cast<unsigned long long>(pack_missed_),
+                     static_cast<unsigned long long>(c.decoded), c.decoded + c.failed != 0 ? c.decode_us / 1000.0 / double(c.decoded + c.failed) : 0.0,
+                     static_cast<unsigned long long>(c.failed), pack_bytes_ >> 20);
+    }
+
+    // Forget textures not used for a while.
+    if ((frame_ & 255u) == 0) {
+        for (auto i = textures_.begin(); i != textures_.end();) {
+            if (i->second.last_use + 600 < frame_) {
+                if (i->second.shown.empty()) gl_.DeleteTextures(1, &i->second.texture); // a pack image's stays with it
+                i = textures_.erase(i);
+            } else {
+                ++i;
+            }
+        }
+    }
+}
+
+void GlBackend::ensure_slot(Slot &slot, GLsizei w, GLsizei h) {
+    if (slot.fbo != 0 && slot.width == w && slot.height == h) return;
+    if (slot.fbo != 0) {
+        gl_.DeleteFramebuffers(1, &slot.fbo);
+        gl_.DeleteTextures(1, &slot.texture);
+    }
+    gl_.GenTextures(1, &slot.texture);
+    gl_.BindTexture(GL_TEXTURE_2D, slot.texture);
+    gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    set_texture_params(true, true, true);
+    gl_.GenFramebuffers(1, &slot.fbo);
+    gl_.BindFramebuffer(GL_FRAMEBUFFER, slot.fbo);
+    gl_.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot.texture, 0);
+    slot.width = w;
+    slot.height = h;
+    previous_valid_ = false; // the older picture, if it was this slot, is gone
+}
+
+namespace {
+
+// How far (PSP pixels) a vertex may move between two flips and still be taken as the same point: beyond that it is
+// a cut, an object appearing, or a different thing drawn in the same place.
+constexpr float kMaxMove = 32.0f;
+
+// Texture coordinates travel with a point of the mesh, so two vertices that are the same point have the same ones
+// (up to a small tolerance); when they differ the pairing is wrong, or the texture is animated.
+constexpr float kMaxUvChange = 0.01f;
+
+bool clearing(const DrawSetup &s) { return (key_reg(s.key, kClearMode) & 1u) != 0; }
+
+// Draw state compared register by register, except the draw buffer address.
+bool same_state(const DrawKey &a, const DrawKey &b) {
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (i < kStateRegs.size() && kStateRegs[i] == kFramebufPtr) continue; // the draw buffer alternates every flip
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+// The same on-screen thing in two flips: same draw state (texture, blending...; the game alternates two draw buffers,
+// so which one it went to does not count), same texture object (a texture whose content changed is another one, see
+// texture_for) and the same number of vertices.
+bool same_batch(const TapeEntry &a, const TapeEntry &b) {
+    return a.vertices.size() == b.vertices.size() && a.setup.through == b.setup.through &&
+           same_state(a.setup.key, b.setup.key) && a.setup.texture == b.setup.texture && a.setup.uv_xform[0] == b.setup.uv_xform[0] &&
+           a.setup.uv_xform[1] == b.setup.uv_xform[1] && a.setup.uv_xform[2] == b.setup.uv_xform[2] &&
+           a.setup.uv_xform[3] == b.setup.uv_xform[3];
+}
+
+// Screen-space (2D) triangles move rigidly: a sprite slides, it does not stretch. Only such triangles, whose texture
+// coordinates stayed the same too, are placed between their two positions.
+constexpr float kMaxRigidSkew = 1.5f;
+
+enum class Move { Still, Blend, Refuse };
+
+Move classify_triangle(const GpuVertex *before, const GpuVertex *now) {
+    float dx[3], dy[3];
+    bool still = true;
+    for (int k = 0; k < 3; ++k) {
+        dx[k] = now[k].x - before[k].x;
+        dy[k] = now[k].y - before[k].y;
+        if (std::fabs(now[k].u - before[k].u) > kMaxUvChange || std::fabs(now[k].v - before[k].v) > kMaxUvChange) {
+            return Move::Refuse;
+        }
+        if (std::fabs(dx[k]) > kMaxMove || std::fabs(dy[k]) > kMaxMove) return Move::Refuse;
+        still = still && std::fabs(dx[k]) < 0.01f && std::fabs(dy[k]) < 0.01f;
+    }
+    if (still) return Move::Still;
+    for (int k = 1; k < 3; ++k) {
+        if (std::fabs(dx[k] - dx[0]) > kMaxRigidSkew || std::fabs(dy[k] - dy[0]) > kMaxRigidSkew) return Move::Refuse;
+    }
+    return Move::Blend;
+}
+
+// `out` holds this flip's vertices; moves each triangle back toward `before` by (1 - t) when it slid rigidly.
+void blend_vertices(const std::vector<GpuVertex> &before, std::span<GpuVertex> out, float t) {
+    for (std::size_t i = 0; i + 2 < out.size(); i += 3) {
+        if (classify_triangle(&before[i], &out[i]) != Move::Blend) continue;
+        for (std::size_t k = 0; k < 3; ++k) {
+            out[i + k].x = before[i + k].x + (out[i + k].x - before[i + k].x) * t;
+            out[i + k].y = before[i + k].y + (out[i + k].y - before[i + k].y) * t;
+        }
+    }
+}
+
+// Pairs the 2D batches of this flip with the previous flip's (looking ahead a few batches) and measures how much of the
+// textured 2D content changed in a way an in-between picture cannot show: sprites that appeared, vanished or jumped.
+// The previous picture is the base of every in-between picture, so such sprites would show twice for a moment (item
+// icons of a list, text). Returns that count in sprites; `partner` gets, per batch of `now`, its pair or -1.
+std::size_t analyze_2d(const std::vector<TapeEntry> &now, const std::vector<TapeEntry> &before, std::vector<int> &partner) {
+    partner.assign(now.size(), -1);
+    std::vector<bool> used(before.size(), false);
+    std::size_t next = 0, changed = 0;
+    for (std::size_t i = 0; i < now.size(); ++i) {
+        const TapeEntry &e = now[i];
+        if (!e.setup.through) continue;
+        for (std::size_t look = 0; look < 4 && next + look < before.size(); ++look) {
+            if (same_batch(e, before[next + look])) {
+                partner[i] = static_cast<int>(next + look);
+                used[next + look] = true;
+                next += look + 1;
+                break;
+            }
+        }
+    }
+    for (std::size_t i = 0; i < now.size(); ++i) {
+        const TapeEntry &e = now[i];
+        if (!e.setup.through || clearing(e.setup) || e.setup.texture == 0) continue;
+        if (partner[i] < 0) {
+            changed += e.vertices.size() / 6;
+            continue;
+        }
+        const TapeEntry &b = before[static_cast<std::size_t>(partner[i])];
+        std::size_t refused = 0;
+        for (std::size_t v = 0; v + 2 < e.vertices.size(); v += 3) {
+            refused += classify_triangle(&b.vertices[v], &e.vertices[v]) == Move::Refuse ? 1u : 0u;
+        }
+        changed += (refused + 1) / 2;
+    }
+    for (std::size_t j = 0; j < before.size(); ++j) {
+        const TapeEntry &b = before[j];
+        if (!used[j] && b.setup.through && !clearing(b.setup) && b.setup.texture != 0) changed += b.vertices.size() / 6;
+    }
+    return changed;
+}
+
+// More changed sprites than this, in a flip that does not clear the screen, and the flip is shown as the game drew it
+// (menus, item lists, dialogs over the previous picture). A flip that clears the colors first (every 3D scene, with
+// its HUD) draws everything again over nothing, so the previous picture cannot show through and nothing is skipped.
+constexpr std::size_t kMaxChangedSprites = 6;
+
+bool clears_screen(const std::vector<TapeEntry> &batches) {
+    for (const TapeEntry &e : batches) {
+        const std::uint32_t mode = key_reg(e.setup.key, kClearMode);
+        if ((mode & 1u) != 0 && (mode & 0x100u) != 0) return true; // clear mode with the color buffer
+    }
+    return false;
+}
+
+bool nearly_equal(float a, float b) { return std::fabs(a - b) <= 1e-3f * std::max(1.0f, std::fabs(a)); }
+
+// The camera of the previous flip that `now` continues: same projection and viewport, and the nearest view matrix,
+// which may only have turned a little (a cut is not interpolated).
+const Camera *continued_camera(const Camera &now, const std::vector<Camera> &before) {
+    const Camera *best = nullptr;
+    float best_distance = 0;
+    for (const Camera &c : before) {
+        bool same_lens = true;
+        for (std::size_t i = 0; i < c.proj.size() && same_lens; ++i) same_lens = nearly_equal(now.proj[i], c.proj[i]);
+        for (std::size_t i = 0; i < c.viewport.size() && same_lens; ++i) same_lens = nearly_equal(now.viewport[i], c.viewport[i]);
+        if (!same_lens) continue;
+        float turn = 0, distance = 0;
+        for (std::size_t i = 0; i < 12; ++i) {
+            const float d = std::fabs(now.view[i] - c.view[i]);
+            if (i < 9) turn += d;
+            distance += d;
+        }
+        if (turn > 0.75f) continue;
+        if (best == nullptr || distance < best_distance) {
+            best = &c;
+            best_distance = distance;
+        }
+    }
+    return best;
+}
+
+Camera between(const Camera &a, const Camera &b, float t) {
+    Camera c = b;
+    for (std::size_t i = 0; i < c.view.size(); ++i) c.view[i] = a.view[i] + (b.view[i] - a.view[i]) * t;
+    for (std::size_t i = 0; i < c.proj.size(); ++i) c.proj[i] = a.proj[i] + (b.proj[i] - a.proj[i]) * t;
+    return c;
+}
+
+// World point to screen (x, y in PSP pixels, z 0..65535, 1/w), like the GE; false behind the near plane.
+bool project(const Camera &c, const float p[3], float out[4]) {
+    float view[3];
+    for (std::size_t i = 0; i < 3; ++i) {
+        view[i] = p[0] * c.view[i] + p[1] * c.view[3 + i] + p[2] * c.view[6 + i] + c.view[9 + i];
+    }
+    float clip[4];
+    for (std::size_t i = 0; i < 4; ++i) {
+        clip[i] = view[0] * c.proj[i] + view[1] * c.proj[4 + i] + view[2] * c.proj[8 + i] + c.proj[12 + i];
+    }
+    if (!(clip[3] > 0.0f) || !(clip[2] > -clip[3])) return false;
+    const float inv_w = 1.0f / clip[3];
+    out[0] = clip[0] * inv_w * c.viewport[0] + c.viewport[3] - c.viewport[6];
+    out[1] = clip[1] * inv_w * c.viewport[1] + c.viewport[4] - c.viewport[7];
+    out[2] = clip[2] * inv_w * c.viewport[2] + c.viewport[5];
+    out[3] = inv_w;
+    return std::isfinite(out[0]) && std::isfinite(out[1]);
+}
+
+// Places a point for an in-between picture: seen through the camera between the two flips and, when the same point
+// was drawn in the previous flip (`was`), moved back toward where it was then (things that move on their own).
+bool place(const float world[3], const float *was, const Camera &camera, float t, float out[4]) {
+    if (!project(camera, world, out)) return false;
+    if (was == nullptr) return true;
+    const float moved[3] = {was[0] + (world[0] - was[0]) * t, was[1] + (world[1] - was[1]) * t,
+                            was[2] + (world[2] - was[2]) * t};
+    // A point that seems to have jumped far is another thing drawn from the same data: keep it where it is now.
+    float s[4];
+    if (project(camera, moved, s) && std::fabs(s[0] - out[0]) <= kMaxMove && std::fabs(s[1] - out[1]) <= kMaxMove) {
+        std::copy(s, s + 4, out);
+    }
+    return true;
+}
+
+} // namespace
+
+// Moves a recorded 3D batch to phase `t` between the previous flip and this one, with `cameras` the cameras at that
+// phase. Each triangle is placed again as a whole, or left where it was drawn when one of its points cannot be (no
+// camera, behind the camera).
+void GlBackend::place_again(const TapeEntry &entry, const std::vector<Camera> &cameras, std::span<GpuVertex> vertices,
+                            float t) const {
+    if (entry.origins.size() != vertices.size()) return;
+    for (std::size_t i = 0; i + 2 < vertices.size(); i += 3) {
+        GpuVertex placed[3];
+        bool ok = true;
+        for (std::size_t k = 0; k < 3 && ok; ++k) {
+            const Origin &o = entry.origins[i + k];
+            placed[k] = vertices[i + k];
+            if (o.camera >= cameras.size()) { // also kNoCamera
+                ok = false;
+                break;
+            }
+            const Camera &camera = cameras[o.camera];
+            float sx[4];
+            ok = place(o.x_world, o.x_moved ? o.x_before : nullptr, camera, t, sx);
+            if (!ok) break;
+            placed[k].x = sx[0];
+            if (o.sprite) {
+                float sy[4];
+                ok = place(o.y_world, o.y_moved ? o.y_before : nullptr, camera, t, sy);
+                placed[k].y = sy[1];
+            } else {
+                placed[k].y = sx[1];
+                placed[k].z = sx[2];
+                placed[k].inv_w = sx[3];
+            }
+        }
+        if (ok) std::copy(placed, placed + 3, vertices.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+}
+
+// Interpolation v2: the batch's triangles before clipping, each moved by its draw's transform at this moment
+// (v2_transforms_), clipped against the near plane, dropped when a point leaves the GE's 4096x4096 space, and placed on
+// the screen through its draw's viewport, as Ge::draw_triangle does for the flip itself.
+// Runs `work(from, to)` over [0, count) in shares of at least `least` items: on the drawing thread alone when small,
+// else split with up to three helper threads.
+template <typename Work> void in_shares(std::size_t count, std::size_t least, const Work &work) {
+    const unsigned cores = std::thread::hardware_concurrency();
+    std::size_t lanes = cores >= 3 ? std::min<std::size_t>(4, cores - 1) : 1;
+    lanes = std::max<std::size_t>(1, std::min(lanes, count / std::max<std::size_t>(1, least)));
+    if (lanes <= 1) {
+        work(0, count);
+        return;
+    }
+    const std::size_t share = (count + lanes - 1) / lanes;
+    std::vector<std::future<void>> helpers;
+    for (std::size_t k = 1; k < lanes; ++k) {
+        const std::size_t from = std::min(count, k * share), to = std::min(count, (k + 1) * share);
+        helpers.push_back(std::async(std::launch::async, [&work, from, to] { work(from, to); }));
+    }
+    work(0, std::min(count, share));
+    for (auto &helper : helpers) helper.get();
+}
+
+// Interpolation v2, once a flip: per draw what its transform needs whatever the moment, and the shown picture's 3D
+// batches cut into shares of about the same number of triangles.
+void GlBackend::prepare_v2(const std::vector<TapeEntry> &now, const std::vector<TapeEntry> &before) {
+    v2_prepared_ = true;
+    const std::vector<interpolation::DrawSummary> &newer = summaries_before_;
+    // Each draw's triangles in both flips, in drawing order (a draw's triangles follow one another across batches).
+    v2_old_tris_.clear();
+    v2_old_first_.assign(v2_older_.size(), 0);
+    v2_old_count_.assign(v2_older_.size(), 0);
+    for (const TapeEntry &e : before) {
+        if (e.setup.through) continue;
+        for (const RawTriangle &tri : e.raw) {
+            if (tri.draw >= v2_older_.size()) continue;
+            if (v2_old_count_[tri.draw]++ == 0) v2_old_first_[tri.draw] = v2_old_tris_.size();
+            v2_old_tris_.push_back(&tri);
+        }
+    }
+    v2_new_first_.assign(newer.size(), 0);
+    v2_new_count_.assign(newer.size(), 0);
+    v2_batch_ordinal_.assign(now.size(), 0);
+    std::size_t ordinal = 0;
+    for (std::size_t i = 0; i < now.size(); ++i) {
+        v2_batch_ordinal_[i] = ordinal;
+        if (now[i].setup.through) continue;
+        for (const RawTriangle &tri : now[i].raw) {
+            if (tri.draw < newer.size() && v2_new_count_[tri.draw]++ == 0) v2_new_first_[tri.draw] = ordinal;
+            ++ordinal;
+        }
+    }
+    v2_draws_.resize(newer.size()); // only the needed draws are read, and each is written whole below
+    std::vector<std::uint8_t> needed(newer.size(), 0);
+    v2_chunks_.clear();
+    v2_first_chunk_.assign(now.size(), 0);
+    constexpr std::size_t kChunk = 768;
+    for (std::size_t i = 0; i < now.size(); ++i) {
+        const TapeEntry &e = now[i];
+        v2_first_chunk_[i] = v2_chunks_.size();
+        if (e.setup.through || !e.raw_complete) continue;
+        for (const RawTriangle &tri : e.raw) {
+            if (tri.draw < needed.size()) needed[tri.draw] = 1;
+        }
+        for (std::size_t from = 0; from < e.raw.size(); from += kChunk) v2_chunks_.push_back({i, from, std::min(e.raw.size(), from + kChunk)});
+    }
+    v2_chunk_out_.resize(v2_chunks_.size());
+    v2_needed_.clear();
+    for (std::size_t n = 0; n < newer.size(); ++n) {
+        if (needed[n] != 0) v2_needed_.push_back(static_cast<std::uint32_t>(n));
+    }
+    in_shares(v2_needed_.size(), 256, [&](std::size_t first, std::size_t last) {
+        for (std::size_t k = first; k < last; ++k) prepare_v2_draw(v2_needed_[k]);
+    });
+}
+
+void GlBackend::prepare_v2_draw(std::uint32_t n) {
+    {
+        const interpolation::DrawSummary &d = summaries_before_[n];
+        V2Draw &out = v2_draws_[n];
+        out = V2Draw{};
+        out.fixed = interpolation::multiply(d.projection, d.view); // as drawn
+        const interpolation::Matrix eye = interpolation::multiply(d.view, d.world);
+        interpolation::Matrix eye_inverse{};
+        if (!interpolation::affine_inverse(eye, eye_inverse)) return;
+        // A point in the world (after the world matrix) is in eye space through the view; there, eye_inverse takes it
+        // back to the model.
+        out.back = interpolation::multiply(eye_inverse, d.view);
+        out.projection_new = d.projection;
+        const std::int32_t o = n < v2_older_of_.size() ? v2_older_of_[n] : -1;
+        if (o >= 0 && static_cast<std::size_t>(o) < v2_older_.size()) {
+            const interpolation::DrawSummary &from = v2_older_[static_cast<std::size_t>(o)];
+            out.older_eye = interpolation::multiply(from.view, from.world);
+            out.projection_old = from.projection;
+            const std::size_t oi = static_cast<std::size_t>(o);
+            interpolation::Matrix older_inverse{};
+            if (d.skinned && v2_new_count_[n] > 0 && v2_new_count_[n] == v2_old_count_[oi] &&
+                interpolation::affine_inverse(out.older_eye, older_inverse)) {
+                out.deform = true;
+                out.old_first = v2_old_first_[oi];
+                out.new_first = v2_new_first_[n];
+                out.back_old = interpolation::multiply(older_inverse, from.view);
+            }
+            if (out.older_eye == eye) {
+                // Fixed in eye space (interpolation::blend_eye keeps it): at most the projection changes.
+                if (from.projection == d.projection && !out.deform) return;
+                out.kind = V2Draw::kStill;
+                out.own = eye;
+                return;
+            }
+            out.kind = V2Draw::kBlend;
+            // The newer transform as the older camera would have seen it (interpolation::blend_eye).
+            out.own = v2_camera_.valid ? interpolation::multiply(v2_camera_.inverse, eye) : eye;
+        } else if (v2_camera_.valid && d.eligible) {
+            // No partner (drawn only in this flip): it moves with the camera only.
+            out.kind = V2Draw::kFollow;
+            out.own = interpolation::multiply(v2_camera_.inverse, eye);
+        }
+    }
+}
+
+void GlBackend::place_v2(std::size_t batch, const TapeEntry &entry, std::size_t from, std::size_t to,
+                         std::vector<GpuVertex> &out) const {
+    struct Clip {
+        float x, y, z, w;
+        const RawVertex *r;
+        float u, v, fog, color[4], spec[3];
+    };
+    const auto lerp = [](const Clip &p, const Clip &q, float s) {
+        Clip c = p;
+        const auto l = [s](float a, float b) { return a + (b - a) * s; };
+        c.x = l(p.x, q.x); c.y = l(p.y, q.y); c.z = l(p.z, q.z); c.w = l(p.w, q.w);
+        c.u = l(p.u, q.u); c.v = l(p.v, q.v); c.fog = l(p.fog, q.fog);
+        for (int k = 0; k < 4; ++k) c.color[k] = l(p.color[k], q.color[k]);
+        for (int k = 0; k < 3; ++k) c.spec[k] = l(p.spec[k], q.spec[k]);
+        return c;
+    };
+    out.reserve((to - from) * 3);
+    for (std::size_t k = from; k < to; ++k) {
+        const RawTriangle &tri = entry.raw[k];
+        if (tri.draw >= v2_transforms_.size() || tri.draw >= viewports_now_.size()) continue;
+        const interpolation::Matrix &m = v2_transforms_[tri.draw];
+        const std::array<float, 8> &vp = viewports_now_[tri.draw];
+        float cx[3], cy[3], cz[3], cw[3];
+        bool all_in = true;
+        const V2Draw &draw = v2_draws_[tri.draw];
+        const RawTriangle *was = nullptr;
+        if (draw.deform) {
+            const std::size_t index = v2_batch_ordinal_[batch] + k - draw.new_first;
+            if (draw.old_first + index < v2_old_tris_.size()) was = v2_old_tris_[draw.old_first + index];
+        }
+        for (int i = 0; i < 3; ++i) {
+            const RawVertex &r = tri.v[i];
+            float x = r.world[0], y = r.world[1], z = r.world[2];
+            if (was != nullptr) {
+                // Both points in the model, blended, then on through this moment's eye and projection.
+                const interpolation::Matrix &bn = draw.back, &bo = draw.back_old;
+                const float *w = was->v[i].world;
+                float model[3];
+                for (int row = 0; row < 3; ++row) {
+                    const float now_at = bn[row] * x + bn[4 + row] * y + bn[8 + row] * z + bn[12 + row];
+                    const float then_at = bo[row] * w[0] + bo[4 + row] * w[1] + bo[8 + row] * w[2] + bo[12 + row];
+                    model[row] = then_at + (now_at - then_at) * v2_t_;
+                }
+                const interpolation::Matrix &vt = v2_view_t_[tri.draw];
+                cx[i] = vt[0] * model[0] + vt[4] * model[1] + vt[8] * model[2] + vt[12];
+                cy[i] = vt[1] * model[0] + vt[5] * model[1] + vt[9] * model[2] + vt[13];
+                cz[i] = vt[2] * model[0] + vt[6] * model[1] + vt[10] * model[2] + vt[14];
+                cw[i] = vt[3] * model[0] + vt[7] * model[1] + vt[11] * model[2] + vt[15];
+                all_in = all_in && cz[i] > -cw[i] && cw[i] > 0.0f;
+                continue;
+            }
+            cx[i] = m[0] * x + m[4] * y + m[8] * z + m[12];
+            cy[i] = m[1] * x + m[5] * y + m[9] * z + m[13];
+            cz[i] = m[2] * x + m[6] * y + m[10] * z + m[14];
+            cw[i] = m[3] * x + m[7] * y + m[11] * z + m[15];
+            all_in = all_in && cz[i] > -cw[i] && cw[i] > 0.0f;
+        }
+        if (all_in) {
+            // The common case: in front of the near plane; straight to the screen, or dropped past the guard band.
+            GpuVertex g[3];
+            bool outside = false;
+            for (int i = 0; i < 3 && !outside; ++i) {
+                const RawVertex &r = tri.v[i];
+                const float inv_w = 1.0f / cw[i];
+                const float sx = cx[i] * inv_w * vp[0] + vp[3], sy = cy[i] * inv_w * vp[1] + vp[4];
+                outside = !(sx >= 0.0f && sx < 4096.0f && sy >= 0.0f && sy < 4096.0f);
+                g[i].x = sx - vp[6];
+                g[i].y = sy - vp[7];
+                g[i].z = cz[i] * inv_w * vp[2] + vp[5];
+                g[i].inv_w = inv_w;
+                g[i].u = r.u;
+                g[i].v = r.v;
+                std::memcpy(g[i].color, r.color, 4);
+                std::memcpy(g[i].spec, r.spec, 4);
+                g[i].fog = r.fog;
+            }
+            if (!outside) out.insert(out.end(), g, g + 3);
+            continue;
+        }
+        Clip in[3];
+        for (int i = 0; i < 3; ++i) {
+            const RawVertex &r = tri.v[i];
+            Clip &c = in[i];
+            c.x = cx[i];
+            c.y = cy[i];
+            c.z = cz[i];
+            c.w = cw[i];
+            c.r = &r;
+            c.u = r.u;
+            c.v = r.v;
+            c.fog = r.fog;
+            for (int k = 0; k < 4; ++k) c.color[k] = r.color[k];
+            for (int k = 0; k < 3; ++k) c.spec[k] = r.spec[k];
+        }
+        const auto to_screen = [&](const Clip &c, GpuVertex &g) {
+            const float inv_w = c.w != 0.0f ? 1.0f / c.w : 1.0f;
+            g.x = c.x * inv_w * vp[0] + vp[3] - vp[6];
+            g.y = c.y * inv_w * vp[1] + vp[4] - vp[7];
+            g.z = c.z * inv_w * vp[2] + vp[5];
+            g.inv_w = inv_w > 0.0f ? inv_w : 1.0f;
+            g.u = c.u;
+            g.v = c.v;
+            for (int k = 0; k < 4; ++k) g.color[k] = to_byte(c.color[k]);
+            for (int k = 0; k < 3; ++k) g.spec[k] = to_byte(c.spec[k]);
+            g.spec[3] = 0;
+            g.fog = c.fog;
+        };
+        // The guard band, for the points in front of the near plane.
+        bool any_clipped = false, outside = false;
+        for (const Clip &c : in) {
+            if (!(c.z > -c.w && c.w > 0.0f)) {
+                any_clipped = true;
+                continue;
+            }
+            const float inv_w = 1.0f / c.w;
+            const float sx = c.x * inv_w * vp[0] + vp[3], sy = c.y * inv_w * vp[1] + vp[4];
+            if (!(sx >= 0.0f && sx < 4096.0f && sy >= 0.0f && sy < 4096.0f)) {
+                outside = true;
+                break;
+            }
+        }
+        if (outside) continue;
+        if (!any_clipped) {
+            for (const Clip &c : in) {
+                GpuVertex g{};
+                to_screen(c, g);
+                out.push_back(g);
+            }
+            continue;
+        }
+        Clip poly[4];
+        int n = 0;
+        for (int i = 0; i < 3; ++i) {
+            const Clip &p = in[i], &q = in[(i + 1) % 3];
+            const float dp = p.z + p.w, dq = q.z + q.w;
+            const bool pin = dp > 0.0f && p.w > 0.0f, qin = dq > 0.0f && q.w > 0.0f;
+            if (pin) poly[n++] = p;
+            if (pin != qin && dp != dq) {
+                const Clip c = lerp(p, q, dp / (dp - dq));
+                if (c.w <= 0.0f) continue;
+                poly[n++] = c;
+            }
+        }
+        if (n < 3) continue;
+        GpuVertex s[4]{};
+        for (int i = 0; i < n; ++i) to_screen(poly[i], s[i]);
+        out.push_back(s[0]);
+        out.push_back(s[1]);
+        out.push_back(s[2]);
+        if (n == 4) {
+            out.push_back(s[0]);
+            out.push_back(s[2]);
+            out.push_back(s[3]);
+        }
+    }
+}
+
+void GlBackend::render_between(const RenderTarget &shown, const std::vector<TapeEntry> &now,
+                               const std::vector<TapeEntry> &before_batches, const Slot &before_slot, float t) {
+    const GLsizei w = static_cast<GLsizei>(shown.width) * scale_, h = static_cast<GLsizei>(shown.height) * scale_;
+    if (scratch_.fbo == 0 || scratch_.width != shown.width || scratch_.height != shown.height) {
+        if (scratch_.fbo != 0) {
+            gl_.DeleteFramebuffers(1, &scratch_.fbo);
+            gl_.DeleteTextures(1, &scratch_.color);
+            gl_.DeleteRenderbuffers(1, &scratch_.depth);
+        }
+        scratch_ = RenderTarget{};
+        scratch_.address = shown.address;
+        scratch_.stride = shown.stride;
+        scratch_.width = shown.width;
+        scratch_.format = shown.format;
+        allocate(scratch_, shown.height);
+    }
+    // Start from the previous picture, with a fresh depth buffer.
+    gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, before_slot.fbo);
+    gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, scratch_.fbo);
+    gl_.Disable(GL_SCISSOR_TEST);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    gl_.DepthMask(GL_TRUE);
+    gl_.Clear(GL_DEPTH_BUFFER_BIT);
+
+    std::vector<Camera> cameras(flip_.cameras.size());
+    for (std::size_t i = 0; i < cameras.size(); ++i) cameras[i] = between(flip_.cameras_before[i], flip_.cameras[i], t);
+    using Clock = std::chrono::steady_clock;
+    const auto us = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<double, std::micro>(to - from).count();
+    };
+    // All the vertices of the picture first (one upload), then the batches draw from ranges of them.
+    const auto t_calc = Clock::now();
+    // Interpolation v2: the 3D batches are made again from their triangles before clipping, moved with their draw's
+    // transforms blended to this moment, then clipped and placed as the GE does (place_v2).
+    const bool v2 = v2_enabled_ && v2_ready_ && !summaries_before_.empty();
+    if (v2) {
+        if (!v2_prepared_) prepare_v2(now, before_batches);
+        v2_t_ = t;
+        // The camera's motion this far, once; then each draw's transform, then the triangles, in even shares.
+        const interpolation::Matrix camera_t = interpolation::rigid_at(v2_camera_, t);
+        v2_transforms_.resize(v2_draws_.size());
+        v2_view_t_.resize(v2_draws_.size());
+        const auto transforms = [&](std::size_t from, std::size_t to) {
+            for (std::size_t k = from; k < to; ++k) {
+                const std::uint32_t n = v2_needed_[k];
+                const V2Draw &d = v2_draws_[n];
+                if (d.kind == V2Draw::kFixed) {
+                    v2_transforms_[n] = d.fixed;
+                    continue;
+                }
+                interpolation::Matrix eye_t;
+                switch (d.kind) {
+                case V2Draw::kStill: eye_t = d.own; break;
+                case V2Draw::kFollow: eye_t = interpolation::multiply(camera_t, d.own); break;
+                default:
+                    eye_t = interpolation::blend_affine(d.older_eye, d.own, t);
+                    if (v2_camera_.valid) eye_t = interpolation::multiply(camera_t, eye_t);
+                    break;
+                }
+                const interpolation::Matrix projection_t =
+                    d.kind == V2Draw::kFollow ? d.projection_new : interpolation::blend_linear(d.projection_old, d.projection_new, t);
+                const interpolation::Matrix view_t = interpolation::multiply(projection_t, eye_t);
+                if (d.deform) v2_view_t_[n] = view_t;
+                v2_transforms_[n] = interpolation::multiply(view_t, d.back);
+            }
+        };
+        const auto chunks = [&](std::size_t from, std::size_t to) {
+            for (std::size_t k = from; k < to; ++k) {
+                const V2Chunk &c = v2_chunks_[k];
+                v2_chunk_out_[k].clear();
+                place_v2(c.batch, now[c.batch], c.from, c.to, v2_chunk_out_[k]);
+            }
+        };
+        in_shares(v2_needed_.size(), 512, transforms);
+        in_shares(v2_chunks_.size(), 1, chunks);
+    }
+    staging_.clear();
+    ranges_.assign(now.size(), Range{});
+    for (std::size_t i = 0; i < now.size(); ++i) {
+        const TapeEntry &entry = now[i];
+        const bool made = v2 && !entry.setup.through && entry.raw_complete;
+        if (made) {
+            const std::size_t first = staging_.size();
+            for (std::size_t k = v2_first_chunk_[i]; k < v2_chunks_.size() && v2_chunks_[k].batch == i; ++k) {
+                staging_.insert(staging_.end(), v2_chunk_out_[k].begin(), v2_chunk_out_[k].end());
+            }
+            ranges_[i] = Range{first, staging_.size() - first};
+            continue;
+        }
+        ranges_[i] = Range{staging_.size(), entry.vertices.size()};
+        staging_.insert(staging_.end(), entry.vertices.begin(), entry.vertices.end());
+    }
+    // Placing the vertices again reads shared data only and writes disjoint ranges of the staging buffer, so big
+    // pictures are split between a few threads (the drawing thread takes the first share).
+    const auto place_batches = [&](std::size_t from, std::size_t to) {
+        for (std::size_t i = from; i < to; ++i) {
+            const TapeEntry &entry = now[i];
+            const std::span<GpuVertex> vertices(staging_.data() + ranges_[i].first, ranges_[i].count);
+            if (entry.setup.through) {
+                const int partner = i < flip_.partner.size() ? flip_.partner[i] : -1;
+                if (partner >= 0 && !clearing(entry.setup)) {
+                    blend_vertices(before_batches[static_cast<std::size_t>(partner)].vertices, vertices, t);
+                }
+            } else if (!(v2 && entry.raw_complete)) {
+                place_again(entry, cameras, vertices, t);
+            }
+        }
+    };
+    const unsigned cores = std::thread::hardware_concurrency();
+    const std::size_t threads = staging_.size() >= 12000 && cores >= 3 ? std::min<std::size_t>(4, cores - 1) : 1;
+    if (threads <= 1) {
+        place_batches(0, now.size());
+    } else {
+        std::vector<std::future<void>> helpers;
+        const std::size_t share = staging_.size() / threads + 1;
+        std::size_t from = 0, end_of_first = 0;
+        for (std::size_t k = 0; k < threads && from < now.size(); ++k) {
+            std::size_t to = from, taken = 0;
+            while (to < now.size() && (taken < share || k + 1 == threads)) taken += ranges_[to++].count;
+            if (k == 0) end_of_first = to;
+            else helpers.push_back(std::async(std::launch::async, place_batches, from, to));
+            from = to;
+        }
+        place_batches(0, end_of_first);
+        for (auto &helper : helpers) helper.get();
+    }
+    const auto t_upload = Clock::now();
+    gl_.BindBuffer(GL_ARRAY_BUFFER, vbo_);
+    gl_.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(staging_.size() * sizeof(GpuVertex)), staging_.data(),
+                   GL_STREAM_DRAW);
+    cost_.calc_us += us(t_calc, t_upload);
+    cost_.upload_us += us(t_upload, Clock::now());
+    for (std::size_t i = 0; i < now.size(); ++i) {
+        if (ranges_[i].count == 0) continue;
+        const auto t_state = Clock::now();
+        emit_state(now[i].setup, scratch_);
+        const auto t_draw = Clock::now();
+        gl_.DrawArrays(GL_TRIANGLES, static_cast<GLint>(ranges_[i].first), static_cast<GLsizei>(ranges_[i].count));
+        cost_.state_us += us(t_state, t_draw);
+        cost_.draw_us += us(t_draw, Clock::now());
+    }
+    ++cost_.pictures;
+    cost_.batches += now.size();
+    cost_.vertices += staging_.size();
+    have_state_ = false;
+}
+
+// Where the shown picture is between the previous flip (0) and this one (1) at `when`. Pictures run one step behind
+// the game: the first one, drawn as the flip arrives, is already one step in, and the flip's own picture is due one
+// step before the next flip is.
+float GlBackend::phase_at(std::chrono::steady_clock::time_point when) const {
+    double elapsed = std::chrono::duration<double>(when - pacing_.start).count();
+    const double interval = std::chrono::duration<double>(pacing_.interval).count();
+    const double step = std::chrono::duration<double>(pacing_.step).count();
+    if (interval <= 0.0 || step <= 0.0) return 1.0f;
+    // A picture always sits exactly on the slot nearest to the moment it is drawn: steady motion moves in whole shares
+    // of a flip's move, also when a busy GE made it late (it is shown at its slot instead of being dropped).
+    elapsed = std::round(elapsed / step) * step;
+    return static_cast<float>(std::clamp((elapsed + step) / interval, 0.0, 1.0));
+}
+
+void GlBackend::show_final() {
+    pacing_.active = false;
+    show(flip_.final_texture, flip_.uv_max[0], flip_.uv_max[1]);
+}
+
+void GlBackend::show_between(float phase) {
+    RenderTarget shown;
+    shown.address = flip_.address;
+    shown.width = flip_.width;
+    shown.height = flip_.height;
+    shown.stride = flip_.stride;
+    shown.format = flip_.format;
+    render_between(shown, *flip_.now, flip_.before, slots_[flip_.before_slot], phase);
+    show(scratch_.color, flip_.uv_max[0], flip_.uv_max[1]);
+}
+
+// Called by the GE worker when the next picture is due (and it has no display list to run). Draws the picture for
+// this moment, however late it is, and asks to be called again one step later; the flip's own picture closes it.
+void GlBackend::tick() {
+    if (!pacing_.active) {
+        redraw_only_ = true; // nothing new to show (the menu is up and no picture came): draw the last one again
+        show(last_texture_, last_uv_[0], last_uv_[1]);
+        redraw_only_ = false;
+        have_state_ = false;
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const float phase = phase_at(now);
+    if (phase >= 0.999f) {
+        show_final();
+        return;
+    }
+    show_between(phase);
+    // The next one at the next slot (anchored to the flip, so waking up a little late does not add up), at once if that
+    // slot has already passed, and never after the moment the flip's own picture is due.
+    const auto final_due = pacing_.start + pacing_.interval - pacing_.step;
+    const double slots = std::chrono::duration<double>(now - pacing_.start).count() /
+                         std::chrono::duration<double>(pacing_.step).count();
+    const std::chrono::steady_clock::time_point next_slot =
+        pacing_.start + pacing_.step * static_cast<std::chrono::steady_clock::rep>(std::floor(slots + 0.5) + 1.0);
+    pacing_.next_due = std::min(std::max(next_slot, now), final_due);
+}
+
+void GlBackend::flush_pictures() {
+    if (pacing_.active) show_final(); // the next flip came before this one was fully shown
+}
+
+// Schedules the in-between pictures, the first one due at once, ending with the flip's own picture. Returns false
+// (nothing scheduled) when this flip cannot be interpolated; the caller then shows it as usual. Either way the picture
+// is kept for the next flip.
+// Matches the draws of this flip with the previous flip's (the second design) and, with
+// MHF_INTERP_V2_LOG=1, reports once a second how the matching went: draws, matched, repaired instances, rejected
+// pairs, the camera's turn and move, and the cuts.
+void GlBackend::match_v2(std::uint32_t shown) {
+    interpolation::mark_eligible(recording_, shown);
+    v2_ready_ = false;
+    v2_prepared_ = false;
+    static const bool log = std::getenv("MHF_INTERP_V2_LOG") != nullptr;
+    struct Totals {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        unsigned flips = 0, cuts = 0, continued = 0;
+        std::uint64_t eligible = 0, matched = 0, repaired = 0, rejected = 0, crowded = 0, objects = 0, votes = 0, voters = 0;
+        float sum_angle = 0;
+        float max_angle = 0, max_distance = 0;
+        double us = 0;
+        std::map<std::string, unsigned> why;
+    };
+    static Totals totals;
+    if (!summaries_before_.empty()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const interpolation::Matching &m = matcher_.match(summaries_before_, recording_, cut_thresholds_);
+        if (v2_enabled_) {
+            v2_older_of_.assign(recording_.size(), -1);
+            for (std::size_t i = 0; i < m.newer_of.size(); ++i) {
+                if (m.newer_of[i] >= 0) v2_older_of_[static_cast<std::size_t>(m.newer_of[i])] = static_cast<std::int32_t>(i);
+            }
+            v2_camera_ = m.camera_found ? interpolation::rigid_motion(m.camera) : interpolation::RigidMotion{};
+            v2_ready_ = m.cut == nullptr;
+        }
+        if (log) {
+            totals.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            ++totals.flips;
+            totals.eligible += m.eligible_newer;
+            totals.matched += m.matched;
+            totals.repaired += m.repaired;
+            totals.rejected += m.rejected;
+            totals.crowded += m.too_many_instances;
+            totals.objects += m.objects;
+            totals.votes += m.camera_votes;
+            totals.voters += m.camera_voters;
+            totals.sum_angle += m.camera_angle_degrees;
+            if (m.continued) ++totals.continued;
+            if (m.cut != nullptr) {
+                ++totals.cuts;
+                ++totals.why[m.cut];
+            }
+            if (m.camera_found) {
+                totals.max_angle = std::max(totals.max_angle, m.camera_angle_degrees);
+                totals.max_distance = std::max(totals.max_distance, m.camera_distance);
+            }
+        }
+    } else {
+        matcher_.forget_motion();
+    }
+    if (v2_enabled_) {
+        v2_older_ = std::move(summaries_before_);
+        viewports_now_ = std::move(recording_viewports_);
+        recording_viewports_.clear();
+    }
+    summaries_before_ = std::move(recording_);
+    recording_.clear();
+    if (!log || std::chrono::steady_clock::now() - totals.start < std::chrono::seconds(1) || totals.flips == 0) return;
+    std::string why;
+    for (const auto &[reason, count] : totals.why) why += " " + reason + " x" + std::to_string(count);
+    std::fprintf(stderr, "[interp2] %u flips: %.0f eligible draws, %.1f%% matched, %llu instances repaired (%llu meshes over the cap), %llu rejected, "
+                         "%.0f objects, camera votes %.0f%%, turn %.2f deg on average and up to %.1f deg, up to %.1f units, "
+                         "%u continued, %u cuts%s, matching %.0f us a flip\n",
+                 totals.flips, static_cast<double>(totals.eligible) / totals.flips,
+                 totals.eligible != 0 ? 100.0 * static_cast<double>(totals.matched) / static_cast<double>(totals.eligible) : 0.0,
+                 static_cast<unsigned long long>(totals.repaired), static_cast<unsigned long long>(totals.crowded),
+                 static_cast<unsigned long long>(totals.rejected), static_cast<double>(totals.objects) / totals.flips,
+                 totals.voters != 0 ? 100.0 * static_cast<double>(totals.votes) / static_cast<double>(totals.voters) : 0.0,
+                 static_cast<double>(totals.sum_angle) / totals.flips, static_cast<double>(totals.max_angle),
+                 static_cast<double>(totals.max_distance), totals.continued, totals.cuts,
+                 why.c_str(), totals.us / totals.flips);
+    totals = Totals{};
+}
+
+bool GlBackend::present_interpolated(RenderTarget &shown, const float uv_max[2]) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto interval = now - last_flip_;
+    last_flip_ = now;
+
+    const GLsizei w = static_cast<GLsizei>(shown.width) * scale_, h = static_cast<GLsizei>(shown.height) * scale_;
+    ensure_slot(slots_[0], w, h);
+    ensure_slot(slots_[1], w, h);
+
+    match_v2(shown.address);
+
+    // The batches that drew to the picture being shown, and whether anything else wrote to it.
+    std::vector<TapeEntry> mine;
+    bool self_sampled = false;
+    for (TapeEntry &e : tape_) {
+        if (e.setup.target != shown.address) continue;
+        self_sampled = self_sampled || e.setup.self_sampled;
+        mine.push_back(std::move(e));
+    }
+    const bool copied = touched_.count(shown.address) != 0 || touched_.count(~0u) != 0;
+
+    // Keep this picture for the next flip.
+    gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, shown.fbo);
+    gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, slots_[fill_slot_].fbo);
+    gl_.Disable(GL_SCISSOR_TEST);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    const auto ms = std::chrono::duration<double, std::milli>(interval).count();
+    bool done = false;
+    std::vector<int> partner;
+    if (!previous_valid_) {
+        ++stats_.skipped_first;
+    } else if (copied || self_sampled) {
+        ++stats_.skipped_copy;
+    } else if (ms < 22.0 || ms > 150.0) {
+        ++stats_.skipped_timing; // already fast, or a stall: nothing to fill in
+    } else if (mine.empty() || previous_.empty()) {
+        ++stats_.skipped_shape;
+    } else if (analyze_2d(mine, previous_, partner) > kMaxChangedSprites && !clears_screen(mine)) {
+        ++stats_.skipped_ui; // lists, menus and dialogs: sprites appear, vanish or jump
+    } else {
+        flip_.partner = std::move(partner);
+        flip_.before = std::move(previous_);
+        flip_.cameras = cameras_;
+        flip_.cameras_before.clear();
+        for (const Camera &c : cameras_) {
+            const Camera *before = continued_camera(c, previous_cameras_);
+            flip_.cameras_before.push_back(before != nullptr ? *before : c);
+        }
+        // Where each point of this flip was in the previous one (objects that move on their own).
+        std::size_t points = 0;
+        for (const TapeEntry &e : flip_.before) points += e.origins.size() * 2;
+        std::size_t capacity = 1024;
+        while (capacity < points * 2) capacity <<= 1;
+        point_table_.assign(capacity, PointSlot{});
+        const std::size_t mask = capacity - 1;
+        const auto slot_of = [mask](std::uint64_t key) {
+            return static_cast<std::size_t>((key * 0x9E3779B97F4A7C15ull) >> 20u) & mask;
+        };
+        const auto insert_point = [&](std::uint64_t key, const float *position) {
+            for (std::size_t i = slot_of(key);; i = (i + 1) & mask) {
+                if (point_table_[i].key == 0) {
+                    point_table_[i] = PointSlot{key, position};
+                    return;
+                }
+                if (point_table_[i].key == key) return;
+            }
+        };
+        const auto find_point = [&](std::uint64_t key) -> const float * {
+            for (std::size_t i = slot_of(key);; i = (i + 1) & mask) {
+                if (point_table_[i].key == key) return point_table_[i].position;
+                if (point_table_[i].key == 0) return nullptr;
+            }
+        };
+        for (const TapeEntry &e : flip_.before) {
+            for (const Origin &o : e.origins) {
+                if (o.x_key != 0) insert_point(o.x_key, o.x_world);
+                if (o.y_key != 0 && o.y_key != o.x_key) insert_point(o.y_key, o.y_world);
+            }
+        }
+        for (TapeEntry &e : mine) {
+            for (Origin &o : e.origins) {
+                if (o.x_key != 0) {
+                    const float *was = find_point(o.x_key);
+                    o.x_moved = was != nullptr;
+                    if (o.x_moved) std::copy(was, was + 3, o.x_before);
+                }
+                if (o.y_key != 0) {
+                    const float *was = find_point(o.y_key);
+                    o.y_moved = was != nullptr;
+                    if (o.y_moved) std::copy(was, was + 3, o.y_before);
+                }
+            }
+            if (is_effect(e.setup.key)) unpair_jumping_particles(e.origins);
+        }
+        flip_.address = shown.address;
+        flip_.width = shown.width;
+        flip_.height = shown.height;
+        flip_.stride = shown.stride;
+        flip_.format = shown.format;
+        flip_.before_slot = 1 - fill_slot_;
+        flip_.final_texture = slots_[fill_slot_].texture;
+        flip_.uv_max[0] = uv_max[0];
+        flip_.uv_max[1] = uv_max[1];
+        pacing_.active = true;
+        pacing_.start = now;
+        pacing_.interval = interval;
+        pacing_.step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval / factor_);
+        pacing_.next_due = now; // the first in-between picture goes out at once
+        ++stats_.interpolated;
+        done = true;
+    }
+    previous_ = std::move(mine);
+    if (done) flip_.now = &previous_; // the pictures of this flip draw from it, and the next flip pairs against it
+    previous_cameras_ = cameras_;
+    previous_valid_ = !copied && !self_sampled && !previous_.empty();
+    fill_slot_ = 1 - fill_slot_;
+
+    static const bool log = std::getenv("MHF_INTERP_LOG") != nullptr;
+    if (log && (stats_.interpolated + stats_.skipped_shape + stats_.skipped_copy + stats_.skipped_timing +
+                stats_.skipped_first + stats_.skipped_ui) % 120 == 0) {
+        std::fprintf(stderr,
+                     "[interp] x%d: interpolated %llu, skipped: first %llu, copy %llu, timing %llu, shape %llu, "
+                     "menus %llu; pictures on screen %.0f per second\n",
+                     factor_, static_cast<unsigned long long>(stats_.interpolated),
+                     static_cast<unsigned long long>(stats_.skipped_first), static_cast<unsigned long long>(stats_.skipped_copy),
+                     static_cast<unsigned long long>(stats_.skipped_timing), static_cast<unsigned long long>(stats_.skipped_shape),
+                     static_cast<unsigned long long>(stats_.skipped_ui),
+                     log_time_ == std::chrono::steady_clock::time_point{}
+                         ? 0.0
+                         : static_cast<double>(shown_ - log_shown_) /
+                               std::chrono::duration<double>(now - log_time_).count());
+        log_shown_ = shown_;
+        log_time_ = now;
+        if (cost_.shows > 0) {
+            const double s = static_cast<double>(cost_.shows);
+            std::fprintf(stderr, "[interp] each picture put on the window: %.2f ms in total, %.2f ms of it in the buffer swap\n",
+                         cost_.show_us / s / 1000.0, cost_.swap_us / s / 1000.0);
+        }
+        if (cost_.pictures > 0) {
+            const double n = static_cast<double>(cost_.pictures);
+            std::fprintf(stderr,
+                         "[interp] per in-between picture: calc %.2f ms, upload %.2f ms, state %.2f ms, draw calls %.2f ms "
+                         "(%.0f batches, %.0f vertices)\n",
+                         cost_.calc_us / n / 1000.0, cost_.upload_us / n / 1000.0, cost_.state_us / n / 1000.0,
+                         cost_.draw_us / n / 1000.0, static_cast<double>(cost_.batches) / n,
+                         static_cast<double>(cost_.vertices) / n);
+            cost_ = {};
+        }
+    }
+    return done;
+}
+
+// Draws `source` small and blurs it a few times, wider each time, into blur_texture_[0].
+void GlBackend::build_blur(GLuint source, float uv_max_x, float uv_max_y) {
+    if (blur_fbo_[0] == 0) {
+        gl_.GenTextures(2, blur_texture_);
+        gl_.GenFramebuffers(2, blur_fbo_);
+        for (int i = 0; i < 2; ++i) {
+            gl_.BindTexture(GL_TEXTURE_2D, blur_texture_[i]);
+            gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kBlurW, kBlurH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            set_texture_params(true, true, true);
+            gl_.BindFramebuffer(GL_FRAMEBUFFER, blur_fbo_[i]);
+            gl_.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, blur_texture_[i], 0);
+        }
+    }
+    gl_.Disable(GL_SCISSOR_TEST);
+    gl_.Disable(GL_DEPTH_TEST);
+    gl_.Disable(GL_BLEND);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.Viewport(0, 0, kBlurW, kBlurH);
+    gl_.BindVertexArray(empty_vao_);
+    gl_.ActiveTexture(GL_TEXTURE0);
+
+    // The picture itself, shrunk: with the present shader (which flips), so row 0 of the target is the picture's bottom.
+    gl_.BindFramebuffer(GL_FRAMEBUFFER, blur_fbo_[0]);
+    gl_.UseProgram(present_program_);
+    gl_.Uniform1i(present_tex_, 0);
+    gl_.Uniform2f(present_uv_max_, uv_max_x, uv_max_y);
+    gl_.BindTexture(GL_TEXTURE_2D, source);
+    set_texture_params(true, true, true);
+    gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    // Blur: horizontal then vertical, three times, each wider than the last. These passes do not flip.
+    gl_.UseProgram(blur_program_);
+    gl_.Uniform1i(blur_tex_, 0);
+    gl_.Uniform2f(blur_uv_off_, 0.0f, 0.0f);
+    gl_.Uniform2f(blur_uv_scale_, 1.0f, 1.0f);
+    gl_.Uniform1f(blur_dim_, 1.0f);
+    const float widths[3] = {1.0f, 2.0f, 4.0f};
+    for (const float width : widths) {
+        const float steps[2][2] = {{width / kBlurW, 0.0f}, {0.0f, width / kBlurH}};
+        for (const auto &step : steps) {
+            gl_.BindFramebuffer(GL_FRAMEBUFFER, blur_fbo_[1]);
+            gl_.BindTexture(GL_TEXTURE_2D, blur_texture_[0]);
+            gl_.Uniform2f(blur_dir_, step[0], step[1]);
+            gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            std::swap(blur_texture_[0], blur_texture_[1]); // the result is blur_texture_[0] again
+            std::swap(blur_fbo_[0], blur_fbo_[1]);
+        }
+    }
+    blur_source_ = source;
+    blur_ready_ = true;
+    have_state_ = false;
+}
+
+// Fills the window with the blurred picture, cropped (not stretched) to the window's shape, and darkened.
+void GlBackend::draw_blurred_background(int window_w, int window_h) {
+    gl_.BindFramebuffer(GL_FRAMEBUFFER, 0);
+    gl_.Viewport(0, 0, window_w, window_h);
+    gl_.Disable(GL_BLEND);
+    gl_.Disable(GL_DEPTH_TEST);
+    gl_.UseProgram(blur_program_);
+    gl_.Uniform1i(blur_tex_, 0);
+    const float picture = 480.0f / 272.0f, window = static_cast<float>(window_w) / static_cast<float>(window_h);
+    float off_x = 0.0f, off_y = 0.0f, scale_x = 1.0f, scale_y = 1.0f;
+    if (window > picture) { // wider than the picture: crop its top and bottom
+        scale_y = picture / window;
+        off_y = (1.0f - scale_y) * 0.5f;
+    } else {                // taller: crop its sides
+        scale_x = window / picture;
+        off_x = (1.0f - scale_x) * 0.5f;
+    }
+    gl_.Uniform2f(blur_uv_off_, off_x, off_y);
+    gl_.Uniform2f(blur_uv_scale_, scale_x, scale_y);
+    gl_.Uniform2f(blur_dir_, 0.0f, 0.0f);
+    gl_.Uniform1f(blur_dim_, 0.55f);
+    gl_.ActiveTexture(GL_TEXTURE0);
+    gl_.BindTexture(GL_TEXTURE_2D, blur_texture_[0]);
+    set_texture_params(true, true, true);
+    gl_.BindVertexArray(empty_vao_);
+    gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+// The player changed the internal resolution: every render target is drawn again at the new size (what was on it is
+// scaled, so the picture does not flash), and what was made for the old size is dropped.
+void GlBackend::apply_live_scale() {
+    const int wanted = std::clamp(live_->scale.exchange(0), 0, 10);
+    if (wanted == 0 || wanted == scale_) return;
+    have_state_ = false;
+    const int old_scale = scale_;
+    for (auto &entry : targets_) {
+        RenderTarget &rt = entry.second;
+        const GLuint old_fbo = rt.fbo, old_color = rt.color, old_depth = rt.depth;
+        const GLsizei old_w = static_cast<GLsizei>(rt.width) * old_scale, old_h = static_cast<GLsizei>(rt.height) * old_scale;
+        rt.fbo = 0; // allocate() must not copy from the old one at the old size
+        scale_ = wanted;
+        allocate(rt, rt.height);
+        scale_ = old_scale;
+        const GLsizei new_w = static_cast<GLsizei>(rt.width) * wanted, new_h = static_cast<GLsizei>(rt.height) * wanted;
+        gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, old_fbo);
+        gl_.BindFramebuffer(GL_DRAW_FRAMEBUFFER, rt.fbo);
+        gl_.Disable(GL_SCISSOR_TEST);
+        gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        gl_.BlitFramebuffer(0, 0, old_w, old_h, 0, 0, new_w, new_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        gl_.DeleteFramebuffers(1, &old_fbo);
+        gl_.DeleteTextures(1, &old_color);
+        gl_.DeleteRenderbuffers(1, &old_depth);
+    }
+    scale_ = wanted;
+    for (Slot &slot : slots_) {
+        if (slot.fbo != 0) {
+            gl_.DeleteFramebuffers(1, &slot.fbo);
+            gl_.DeleteTextures(1, &slot.texture);
+        }
+        slot = Slot{};
+    }
+    if (scratch_.fbo != 0) {
+        gl_.DeleteFramebuffers(1, &scratch_.fbo);
+        gl_.DeleteTextures(1, &scratch_.color);
+        gl_.DeleteRenderbuffers(1, &scratch_.depth);
+    }
+    scratch_ = RenderTarget{};
+    previous_valid_ = false;
+    last_texture_ = 0;
+    blur_ready_ = false;
+    std::fprintf(stderr, "[gl] internal resolution now %dx%d\n", 480 * scale_, 272 * scale_);
+}
+
+// The player changed the frame rate: from the next picture on, the game's flips are followed by the new number of
+// in-between pictures (or by none).
+void GlBackend::apply_live_fps() {
+    const int fps = live_->fps.exchange(0);
+    if (fps <= 0) return;
+    const int factor = std::clamp((fps + 15) / 30, 1, 6);
+    if (factor == factor_) return;
+    factor_ = factor;
+    interpolate_ = factor > 1;
+    previous_valid_ = false;
+    previous_.clear();
+    std::fprintf(stderr, "[gl] frame rate now %d fps\n", factor_ * 30);
+}
+
+void GlBackend::draw_overlay() {
+    if (overlay_ == nullptr) return;
+    {
+        std::lock_guard lock(overlay_->mutex);
+        if (overlay_->generation != overlay_generation_) {
+            overlay_generation_ = overlay_->generation;
+            if (overlay_->visible && !overlay_visible_) overlay_shown_at_ = SDL_GetTicks();
+            overlay_visible_ = overlay_->visible && overlay_->width > 0;
+            if (overlay_visible_) {
+                gl_.BindTexture(GL_TEXTURE_2D, overlay_texture_);
+                gl_.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, overlay_->width, overlay_->height, 0, GL_RGBA,
+                               GL_UNSIGNED_BYTE, overlay_->pixels.data());
+            }
+        }
+    }
+    if (!overlay_visible_) return;
+    const float t = static_cast<float>(SDL_GetTicks() - overlay_shown_at_) / 150.0f;
+    const float alpha = std::clamp(t, 0.0f, 1.0f);
+    gl_.Disable(GL_DEPTH_TEST);
+    gl_.Enable(GL_BLEND);
+    gl_.BlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    gl_.BlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    gl_.UseProgram(overlay_program_);
+    gl_.Uniform1i(overlay_tex_, 0);
+    gl_.Uniform1f(overlay_alpha_, alpha * (2.0f - alpha)); // ease out
+    gl_.Uniform2f(overlay_uv_max_, 1.0f, 1.0f);
+    gl_.ActiveTexture(GL_TEXTURE0);
+    gl_.BindTexture(GL_TEXTURE_2D, overlay_texture_);
+    set_texture_params(true, true, true);
+    gl_.BindVertexArray(empty_vao_);
+    gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    gl_.Disable(GL_BLEND);
+}
+
+void GlBackend::dump_window(int w, int h) {
+    static const char *folder = std::getenv("MHF_GL_DUMP");
+    static const unsigned long every = [] {
+        const char *v = std::getenv("MHF_GL_DUMP_EVERY");
+        return v != nullptr ? std::max(1ul, std::strtoul(v, nullptr, 10)) : 60ul;
+    }();
+    static const unsigned long from = [] {
+        const char *v = std::getenv("MHF_GL_DUMP_FROM"); // first presented frame to dump
+        return v != nullptr ? std::strtoul(v, nullptr, 10) : 0ul;
+    }();
+    if (folder == nullptr || w <= 0 || h <= 0 || shown_ < from || shown_ % every != 0) return;
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(w) * h * 3u);
+    gl_.PixelStorei(GL_PACK_ALIGNMENT, 1);
+    gl_.ReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/gl_%06llu.ppm", folder, static_cast<unsigned long long>(shown_));
+    if (std::FILE *f = std::fopen(path, "wb")) {
+        std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = h - 1; y >= 0; --y) std::fwrite(rgb.data() + static_cast<std::size_t>(y) * w * 3u, 1, static_cast<std::size_t>(w) * 3u, f);
+        std::fclose(f);
+    }
+}
+
+} // namespace
+
+std::unique_ptr<gpu::Backend> make_gl_backend(SDL_Window *window, int scale, psprecomp::GuestMemory &memory,
+                                              bool smooth_textures, OverlayImage *overlay, int target_fps,
+                                              LiveSettings *live) {
+    if (const char *v = std::getenv("MHF_FPS")) target_fps = std::atoi(v); // testing aid
+    // The game flips at 30 fps: the output rate is a whole multiple of it, from 1x (as the game) to 6x (180 fps).
+    const int factor = std::clamp((target_fps + 15) / 30, 1, 6);
+    auto backend = std::make_unique<GlBackend>(window, scale, memory, smooth_textures, overlay, factor, live);
+    if (!backend->init()) return nullptr;
+    return backend;
+}
+
+} // namespace mhf::psp

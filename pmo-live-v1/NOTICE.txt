@@ -1,0 +1,4 @@
+Runtime GE derivato da Mango77x/MHForever: https://github.com/Mango77x/MHForever
+GPL-3.0-or-later; vedere LICENSE e le attribuzioni del progetto.
+Backend Vita e modulo PMO: modifiche al progetto locale.
+Le dipendenze esterne mantengono le proprie licenze e non sono incluse qui.

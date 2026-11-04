@@ -1,0 +1,106 @@
+#include <cstdlib>
+// Experimental offline boot runner. No game code or assets in this source.
+#include "mhf/psp/runtime.hpp"
+#include "vita_present.hpp"
+#include "mhf/psp/generated.hpp"
+#include "iso9660.hpp"
+#include "param_sfo.hpp"
+#include <psp2/ctrl.h>
+#include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
+#include <chrono>
+#include <thread>
+#include <psp2/kernel/threadmgr.h>
+#include <cstdio>
+#include <exception>
+#include <stdexcept>
+
+extern "C" { unsigned int _newlib_heap_size_user = 128u * 1024u * 1024u; }
+namespace mhf::psp::generated { std::span<const Program *const> mhfu_programs(); }
+namespace {
+void overlay(mhf::psp::Runtime &rt, mhf::psp::Context &ctx) {
+    const auto image = ctx.gpr[4];
+    if (!rt.memory().contains(image, 8)) { rt.fatal("overlay header outside guest memory"); return; }
+    const auto id = static_cast<std::int32_t>(rt.memory().load32(image + 4));
+    if (!rt.activate_overlay(id)) rt.fatal("overlay missing from generated program registry");
+    std::fprintf(stderr, "[boot] overlay %d activated\n", id);
+}
+}
+int main() {
+    sceIoMkdir("ux0:data/pocketprobe", 0777);
+    if (!std::freopen("ux0:data/pocketprobe/boot.log", "w", stderr)) {
+        sceKernelExitProcess(2); return 2;
+    }
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::fprintf(stderr, "[boot] experimental game entry; no GPU/audio frontend; offline\n");
+    int status = 1;
+    try {
+        mhf::psp::RuntimeOptions options;
+        options.disc_image = "ux0:data/pocketprobe/game.iso";
+        options.memstick_root = "ux0:data/pocketprobe/boot-ms";
+        options.font_directory = "ux0:data/pocketprobe/fonts";
+        options.fiber_stack_size = 512u * 1024u;
+        options.trace_imports = false;
+        // Separate storage: do not touch existing PSP saves.
+        sceIoMkdir("ux0:data/pocketprobe/boot-ms", 0777);
+        mhf::psp::IsoImage iso(options.disc_image);
+        const auto entry = iso.find("/PSP_GAME/PARAM.SFO");
+        if (!entry) throw std::runtime_error("PARAM.SFO absent from ISO");
+        const auto sfo = mhf::psp::ParamSfo::parse(iso.read_file(*entry,0,entry->size));
+        if (!sfo || sfo->string("DISC_ID") != "ULES01213" || sfo->string("DISC_VERSION") != "1.01")
+            throw std::runtime_error("runner requires unmodified EU ULES01213 version 1.01");
+        std::fprintf(stderr, "[boot] ISO identity checked; hashes not checked\n");
+        ::setenv("POCKET_HEADLESS_AUDIO_PACING", "1", 1);
+        mhf::psp::Runtime runtime(options);
+        std::fprintf(stderr, "[boot] Runtime constructed; loading prepared ELF\n");
+        runtime.load_elf("ux0:data/pocketprobe/prepared.elf");
+        const auto programs = mhf::psp::generated::mhfu_programs();
+        if (programs.empty()) throw std::runtime_error("generated registry empty");
+        for (std::size_t i = 1; i < programs.size(); ++i) runtime.add_overlay(*programs[i]);
+        runtime.register_hook("mh_overlay_prepare", overlay);
+        sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
+        const auto begin = std::chrono::steady_clock::now();
+        // Cooperative time limit: serviced only when guest code yields to the host.
+        // Independent diagnostic watchdog
+        std::thread([] {
+            sceKernelDelayThread(3630u * 1000000u);
+            std::fprintf(stderr, "[watchdog] 63630 seconds reached; forcing diagnostic exit\\n");
+            std::fflush(stderr);
+            sceKernelExitProcess(124);
+        }).detach();
+
+        auto last_snapshot = begin;
+        runtime.kernel_host_poll([&] {
+            SceCtrlData pad{};
+            sceCtrlPeekBufferPositive(0, &pad, 1);
+            pocket_update_input(runtime, pad);
+
+            static bool stopping = false;
+            if (stopping) return;
+
+            if ((pad.buttons & (SCE_CTRL_START | SCE_CTRL_SELECT)) ==
+                (SCE_CTRL_START | SCE_CTRL_SELECT)) {
+                stopping = true;
+                std::fprintf(stderr, "[boot] exit reason: START+SELECT\\n");
+                runtime.exit_program_from_host(0);
+                return;
+            }
+
+            if (std::chrono::steady_clock::now() - begin >
+                std::chrono::seconds(3600)) {
+                stopping = true;
+                std::fprintf(stderr, "[boot] exit reason: test timeout 3600 seconds\\n");
+                runtime.exit_program_from_host(0);
+            }
+        });
+        std::fprintf(stderr, "[boot] starting generated entry; registered %u programs\n", static_cast<unsigned>(programs.size()));
+        status = runtime.run(*programs.front(), "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN");
+        std::fprintf(stderr, "[boot] scheduler returned %d; this does not establish successful game boot\n", status);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[boot] exception: %s\n", e.what());
+    }
+    std::fprintf(stderr, "[boot] runner exit %d\n", status);
+    std::fflush(stderr);
+    sceKernelExitProcess(status);
+    return status;
+}

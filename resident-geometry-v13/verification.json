@@ -1,0 +1,20 @@
+{
+  "version": "v13",
+  "arm_build_verified": false,
+  "vita_tested": false,
+  "fps_gain_measured": false,
+  "capture_draws": 32,
+  "replay_passes": 2,
+  "raster_input_triangle_vertices": 630,
+  "old_new_raster_input_sha256": "b6c00fee523f2b36f433d31bb5eebc236ed1f2c3ccb01b3f4ace7b6c0f0f750e",
+  "output_byte_identical": true,
+  "vbo_uploads_first_pass": 27,
+  "vbo_uploads_second_pass": 0,
+  "clipping_boxes": 6110,
+  "clipping_interior_points": 611000,
+  "reference_culled_draws": 1746,
+  "asan_ubsan_passed": true,
+  "leak_detection": false,
+  "installer_full_chain_passed": true,
+  "scope": "Reusable rigid packets and batched VBO integration inside GE backend; PMO producer replacement not implemented."
+}

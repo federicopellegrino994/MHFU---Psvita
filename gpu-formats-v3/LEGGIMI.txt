@@ -1,0 +1,10 @@
+GPU formats v3 — richiede PMO screen v2.
+Estende le primitive rigide senza illuminazione e pesi a posizioni 8/16 bit e float, colori PSP e indici assenti/8/16 bit.
+Ritaglio incerto, illuminazione, skinning e morphing usano il percorso CPU.
+Estrarre gpu-formats-v3 in ~/mhfu-vita.
+python3 gpu-formats-v3/apply.py
+cmake --build build/full-runtime-vita --target pocket-game-boot.vpk-vpk -j2
+Reinstallare il VPK.
+Ripristino: python3 gpu-formats-v3/apply.py --restore
+Ricompilare e reinstallare dopo il ripristino.
+Prestazioni e compilazione ARM da verificare sulla Vita.

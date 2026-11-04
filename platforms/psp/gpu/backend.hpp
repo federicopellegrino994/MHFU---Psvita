@@ -1,0 +1,74 @@
+#pragma once
+
+// Hardware drawing behind the GE (docs/05-runtime-hle.md §6).
+//
+// The Ge class keeps doing everything the PSP does before rasterization (list processing, vertex decoding,
+// transform, lighting, near-plane clipping, viewport mapping). With a backend installed, the resulting screen-space
+// primitives go to the backend instead of the software rasterizer; the backend reads the rest of the draw state
+// (textures, blending, tests, framebuffer) from the GE registers through the Ge it is given.
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <optional>
+
+namespace pocket::pmo {struct Geometry;}
+
+namespace mhf::psp::gpu {
+
+class Ge;
+struct Vertex;
+
+// What a drawing command is, for frame interpolation: what it reads (its identity from one frame to the next) and the
+// matrices it is drawn with (column-major, as the GE holds them: world and view 4x3, the projection 4x4).
+struct DrawInfo {
+    std::uint32_t vertex_address{}, index_address{}, vertex_type{}, texture_address{}, count{};
+    std::uint8_t primitive{};
+    bool through{}; // 2D: screen coordinates, no matrices
+    bool clear{};   // clear mode
+    std::uint32_t target{}; // the framebuffer drawn into (its offset in VRAM)
+    std::array<float, 12> world{}, view{};
+    std::array<float, 16> projection{};
+    std::array<float, 8> viewport{}; // x, y, z scale; x, y, z centre; the screen offset x, y
+};
+
+class Backend {
+public:
+    virtual ~Backend() = default;
+    virtual bool supports_native_pmo() const {return false;}
+    virtual bool draw_native_group(const Ge &,const pocket::pmo::Geometry &) {return false;}
+    // Return true only after consuming this entire draw. False keeps the
+    // reference GE pipeline. Raw guest memory is copied before returning.
+    virtual bool draw_rigid(const Ge &, unsigned, unsigned, std::uint32_t, std::uint32_t) { return false; }
+
+    // Screen-space vertices: x, y in framebuffer pixels, z in 0..65535, w = 1/w for perspective correction (1 in
+    // through mode), u, v normalized (through mode: texels), colors 0..255, fog 0..1.
+    virtual void triangle(const Ge &ge, const Vertex &a, const Vertex &b, const Vertex &c) = 0;
+    // A 3D triangle as the GE has it before clipping and culling (clip-space vertices, with their world positions),
+    // for frame interpolation; triangle() follows for what of it reaches the screen.
+    virtual void triangle_unclipped(const Ge &ge, const Vertex &a, const Vertex &b, const Vertex &c) {
+        (void)ge;
+        (void)a;
+        (void)b;
+        (void)c;
+    }
+    // A drawing command starts (called even when nothing of it reaches the screen).
+    virtual void draw_started(const DrawInfo &draw) { (void)draw; }
+    // Axis-aligned rectangle between two corners; color, depth and fog come from `b`.
+    virtual void sprite(const Ge &ge, const Vertex &a, const Vertex &b) = 0;
+    // A block transfer (GE copy between memory rectangles) has been performed in guest memory.
+    virtual void block_transfer(std::uint32_t src, std::uint32_t src_stride, std::uint32_t sx, std::uint32_t sy,
+                                std::uint32_t dst, std::uint32_t dst_stride, std::uint32_t dx, std::uint32_t dy,
+                                std::uint32_t width, std::uint32_t height, std::uint32_t bytes_per_pixel) = 0;
+    // The current display list has ended (or stalled): submit pending work.
+    virtual void flush() = 0;
+    // The game asked to show the framebuffer at `address` (VRAM, as given to sceDisplaySetFrameBuf).
+    virtual void present(std::uint32_t address, std::uint32_t stride, std::uint32_t pixel_format) = 0;
+
+    // For backends that show more than one picture per flip (frame interpolation): when `tick` should be called next
+    // (on the steady clock), or nothing. Called on the thread that owns the backend, between display lists.
+    [[nodiscard]] virtual std::optional<std::chrono::steady_clock::time_point> next_wakeup() const { return std::nullopt; }
+    virtual void tick() {}
+};
+
+} // namespace mhf::psp::gpu

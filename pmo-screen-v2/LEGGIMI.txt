@@ -1,0 +1,14 @@
+PMO screen v2 — base richiesta PMO live v1.
+Riutilizza la proiezione a schermo dei vertici condivisi nei gruppi PMO CPU.
+Test host: 264 combinazioni modello/posa, output GE identico; confronto VitaGpu superato.
+Compilazione ARM e prestazioni Vita da verificare.
+
+Estrarre pmo-screen-v2 dentro ~/mhfu-vita.
+Da ~/mhfu-vita:
+python3 pmo-screen-v2/apply.py
+cmake --build build/full-runtime-vita --target pocket-game-boot.vpk-vpk -j2
+Reinstallare pocket-game-boot.vpk sulla Vita.
+
+Ripristino:
+python3 pmo-screen-v2/apply.py --restore
+Ricompilare e reinstallare.

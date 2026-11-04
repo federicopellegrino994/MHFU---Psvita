@@ -1,0 +1,5 @@
+{
+  "base_gpu_sha256": "f9dc5ecadefbffc2306d2b7e25773da5530759a2bc0fe5919164404d3a4ecb24",
+  "resident_geometry.hpp": "53cca7f23139179c749ff945f8ef1cb8d891dc639c10831a64d159f7f6faec1a",
+  "vita_gpu.cpp": "851d2ca0939eea4e4de4c932ef657763f736a6c7658c051d0a23ce52fb864f23"
+}

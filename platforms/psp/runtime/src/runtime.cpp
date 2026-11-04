@@ -1,0 +1,391 @@
+#include "mhf/psp/runtime.hpp"
+
+#include "hle.hpp"
+#include "interpreter.hpp"
+#include "kernel.hpp"
+
+#include "psprecomp/common.hpp"
+#include "psprecomp/elf32.hpp"
+
+#include <algorithm>
+#include <thread>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+namespace mhf::psp {
+
+namespace {
+Runtime *g_active = nullptr;
+
+std::uint64_t hle_key(std::string_view library, std::uint32_t nid) {
+    return (static_cast<std::uint64_t>(std::hash<std::string_view>{}(library)) << 32u) ^ nid;
+}
+
+constexpr int kBootThreadPriority = 0x20;
+constexpr std::uint32_t kBootThreadStack = 0x40000u;
+} // namespace
+
+Runtime *Runtime::active() noexcept { return g_active; }
+
+namespace {
+
+// Folder of the running executable (empty if unknown).
+std::filesystem::path executable_directory() {
+#if defined(_WIN32)
+    wchar_t buffer[32768];
+    const DWORD n = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
+    if (n == 0 || n >= std::size(buffer)) return {};
+    return std::filesystem::path(std::wstring(buffer, n)).parent_path();
+#else
+    std::error_code ec;
+    const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    return ec ? std::filesystem::path() : exe.parent_path();
+#endif
+}
+
+} // namespace
+
+Runtime::Runtime(RuntimeOptions options)
+    : options_(std::move(options)), memory_(options_.ram_size), kernel_(std::make_unique<Kernel>(*this)) {
+    g_active = this;
+    // A relative font folder that does not exist from the working directory is looked up next to the executable.
+    if (std::error_code ec; options_.font_directory.is_relative() && !std::filesystem::is_directory(options_.font_directory, ec)) {
+        if (const auto dir = executable_directory(); !dir.empty()) options_.font_directory = dir / options_.font_directory;
+    }
+    if (const char *v = std::getenv("MHF_INTERPRET_ONLY"); v != nullptr && v[0] == '1') interpret_only_ = true;
+    add_hle(hle::thread_functions());
+    add_hle(hle::sysmem_functions());
+    add_hle(hle::io_functions());
+    add_hle(hle::system_functions());
+    add_hle(hle::display_functions());
+    add_hle(hle::misc_functions());
+    add_hle(hle::ge_functions());
+    add_hle(hle::media_functions());
+    add_hle(hle::mpeg_functions());
+    add_hle(hle::sas_functions());
+    add_hle(hle::atrac_functions());
+    add_hle(hle::utility_functions());
+    add_hle(hle::font_functions());
+    add_hle(hle::net_functions());
+    add_hle(hle::net_socket_functions());
+}
+
+Runtime::~Runtime() {
+    hle::ge_shutdown(*this);
+    ticker_stop_ = true;
+    if (ticker_.joinable()) ticker_.join();
+    hle::ge_release(*this);
+    hle::display_release(*this);
+    hle::io_release(*this);
+    hle::mpeg_release(*this);
+    hle::net_release(*this);
+    if (g_active == this) {
+        g_active = nullptr;
+    }
+}
+
+void Runtime::add_program(const Program &program) {
+    functions_.insert(functions_.end(), program.functions.begin(), program.functions.end());
+    for (const auto &import : program.imports) import_stubs_.push_back(import.stub);
+    std::sort(import_stubs_.begin(), import_stubs_.end());
+    std::sort(functions_.begin(), functions_.end(),
+              [](const FunctionEntry &a, const FunctionEntry &b) { return a.address < b.address; });
+}
+
+void Runtime::add_hle(std::span<const HleFunction> functions) {
+    for (const auto &f : functions) {
+        hle_[hle_key(f.library, f.nid)] = &f;
+    }
+}
+
+void Runtime::add_overlay(const Program &overlay) {
+    overlays_[overlay.overlay_id] = &overlay;
+    for (auto &region : overlay_regions_) {
+        if (region.start == overlay.code_start || (overlay.code_start < region.end && overlay.code_end > region.start)) {
+            region.start = std::min(region.start, overlay.code_start);
+            region.end = std::max(region.end, overlay.code_end);
+            return;
+        }
+    }
+    overlay_regions_.push_back({overlay.code_start, overlay.code_end, nullptr});
+}
+
+bool Runtime::activate_overlay(std::int32_t overlay_id) {
+    const auto it = overlays_.find(overlay_id);
+    if (it == overlays_.end()) {
+        return false;
+    }
+    for (auto &region : overlay_regions_) {
+        if (it->second->code_start >= region.start && it->second->code_start < region.end) {
+            region.active = it->second;
+            ++overlay_activations_;
+            return true;
+        }
+    }
+    return false;
+}
+
+const Program *Runtime::active_overlay_at(std::uint32_t address) const noexcept {
+    for (const auto &region : overlay_regions_) {
+        if (address >= region.start && address < region.end) {
+            return region.active;
+        }
+    }
+    return nullptr;
+}
+
+void Runtime::register_hook(std::string name, HookFunction function) { hooks_[std::move(name)] = function; }
+
+HookFunction Runtime::find_hook(std::string_view name) const {
+    const auto it = hooks_.find(std::string(name));
+    return it != hooks_.end() ? it->second : nullptr;
+}
+
+const HleFunction *Runtime::find_hle(std::string_view library, std::uint32_t nid) const {
+    const auto it = hle_.find(hle_key(library, nid));
+    return it != hle_.end() ? it->second : nullptr;
+}
+
+void Runtime::load_elf(const std::filesystem::path &path) {
+    const auto elf = psprecomp::Elf32Image::from_file(path);
+    if (elf.is_psp_prx()) {
+        throw std::runtime_error("relocatable modules are not supported yet: " + path.string());
+    }
+    elf.load_into(memory_, 0u);
+    for (const auto &segment : elf.segments()) {
+        if (segment.type == 1u && segment.memory_size != 0) {
+            const int partition = segment.vaddr >= SysMem::kUserPartitionStart ? 2 : 1;
+            if (!kernel_->sysmem().reserve(partition, "module", segment.vaddr, segment.memory_size)) {
+                throw std::runtime_error("module segment overlaps reserved memory");
+            }
+        }
+    }
+}
+
+int Runtime::run(const Program &program, std::string_view boot_path) {
+    add_program(program);
+    kernel_->set_module_gp(program.gp);
+    if (const auto slash = boot_path.rfind('/'); slash != std::string_view::npos) {
+        hle::set_working_directory(*this, std::string(boot_path.substr(0, slash)));
+    }
+    // Boot arguments: the path of the executable, as the PSP loader passes it.
+    const std::string path{boot_path};
+    const auto args = kernel_->sysmem().allocate(1, "bootargs", SysMem::Placement::Low,
+                                                 static_cast<std::uint32_t>(path.size() + 1));
+    if (!args) {
+        throw std::runtime_error("cannot allocate boot arguments");
+    }
+    memory_.zero(args->address, args->size);
+    memory_.copy_in(args->address, std::span(reinterpret_cast<const std::uint8_t *>(path.data()), path.size()));
+    const int uid = kernel_->create_thread("root", program.entry, kBootThreadPriority, kBootThreadStack, 0);
+    if (uid < 0) {
+        throw std::runtime_error("cannot create the boot thread");
+    }
+    kernel_->start_thread(uid, static_cast<std::uint32_t>(path.size() + 1), args->address);
+    ticker_ = std::thread([this] {
+        // MHF_WATCHDOG=<seconds>: when the game presents no frame for that long, say what it was doing and what every PSP thread
+        // waits for (then again after twice and three times as long). A diagnostic for hangs, off by default; the in-game menu
+        // stops the frames too, so it reports there as well. The thread list is read while the game runs, which is fine for a
+        // report that only has to be roughly right.
+        double stall_seconds = 0;
+        if (const char *v = std::getenv("MHF_WATCHDOG")) stall_seconds = std::atof(v);
+        auto last_change = std::chrono::steady_clock::now();
+        std::uint64_t seen_frames = 0;
+        int reports = 0;
+        // MHF_WATCH_MEM=<hex address>:<hex length>[,...]: print a range of guest memory whenever it changes (checked every 20 ms,
+        // so short-lived values can be missed). A reverse-engineering aid, off by default.
+        struct Watch {
+            std::uint32_t address, length;
+            std::vector<std::uint8_t> last;
+        };
+        std::vector<Watch> watches;
+        if (const char *v = std::getenv("MHF_WATCH_MEM")) {
+            for (std::string_view rest = v; !rest.empty();) {
+                const auto comma = rest.find(',');
+                const std::string item(rest.substr(0, comma));
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+                const auto colon = item.find(':');
+                if (colon == std::string::npos) continue;
+                watches.push_back({static_cast<std::uint32_t>(std::strtoul(item.c_str(), nullptr, 16)),
+                                   static_cast<std::uint32_t>(std::strtoul(item.c_str() + colon + 1, nullptr, 16)), {}});
+            }
+        }
+        const auto watch_start = std::chrono::steady_clock::now();
+        unsigned ticks = 0;
+        while (!ticker_stop_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            abi::interrupt_pending.store(true, std::memory_order_relaxed);
+            if (!watches.empty() && ++ticks % 10 == 0) {
+                for (Watch &w : watches) {
+                    std::vector<std::uint8_t> now(w.length);
+                    for (std::uint32_t i = 0; i < w.length; ++i) now[i] = memory_.load8(w.address + i);
+                    if (now == w.last) continue;
+                    w.last = now;
+                    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - watch_start).count();
+                    for (std::uint32_t row = 0; row < w.length; row += 32) {
+                        std::fprintf(stderr, "[watch] %.2f s %08X:", t, w.address + row);
+                        for (std::uint32_t i = row; i < w.length && i < row + 32; ++i) std::fprintf(stderr, "%s%02X", i % 4 ? "" : " ", now[i]);
+                        std::fputc('\n', stderr);
+                    }
+                }
+            }
+            if (stall_seconds <= 0) continue;
+            const auto now = std::chrono::steady_clock::now();
+            const std::uint64_t frames = frames_.load(std::memory_order_relaxed);
+            if (frames != seen_frames) {
+                seen_frames = frames;
+                last_change = now;
+                reports = 0;
+            } else if (frames > 0 && reports < 3 && std::chrono::duration<double>(now - last_change).count() >= stall_seconds * (reports + 1)) {
+                ++reports;
+                const char *last = last_import_.load(std::memory_order_relaxed);
+                std::fprintf(stderr, "[watchdog] no frame for %.0f s; last system call: %s (%llu calls so far)\n", stall_seconds * reports,
+                             last != nullptr ? last : "none", static_cast<unsigned long long>(imports_.load(std::memory_order_relaxed)));
+                std::fprintf(stderr, "[watchdog] the interpreter last jumped backwards at %08X\n", interpreter_last_backward_branch());
+                kernel_->dump_threads(stderr);
+            }
+        }
+    });
+    return kernel_->run_scheduler();
+}
+
+namespace {
+GuestFunction find_in(std::span<const FunctionEntry> table, std::uint32_t address) {
+    const auto it = std::lower_bound(table.begin(), table.end(), address,
+                                     [](const FunctionEntry &e, std::uint32_t a) { return e.address < a; });
+    return it != table.end() && it->address == address ? it->function : nullptr;
+}
+} // namespace
+
+GuestFunction Runtime::lookup(std::uint32_t address) const noexcept {
+    if (!overlay_regions_.empty()) {
+        for (const auto &region : overlay_regions_) {
+            if (address >= region.start && address < region.end) {
+                return region.active != nullptr ? find_in(region.active->functions, address) : nullptr;
+            }
+        }
+    }
+    return find_in(functions_, address);
+}
+
+void Runtime::call(Context &ctx, std::uint32_t address) {
+    GuestFunction f = lookup(address & 0x3FFFFFFFu);
+    if (interpret_only_ && f != nullptr &&
+        !std::binary_search(import_stubs_.begin(), import_stubs_.end(), address & 0x3FFFFFFFu)) {
+        f = nullptr;
+    }
+    if (f == nullptr) {
+        const std::uint32_t a = address & 0x3FFFFFFFu;
+        if (a < 0x08800000u || a >= 0x0A000000u || (a & 3u) != 0) {
+            fatal("call to invalid address " + psprecomp::hex32(address) + " (called from $ra=" +
+                  psprecomp::hex32(ctx.gpr[31]) + ")");
+        }
+        interpret_call(*this, ctx, address);
+        return;
+    }
+    f(*this, ctx);
+}
+
+void Runtime::unsupported(std::uint32_t pc, std::uint32_t word, const char *reason) {
+    fatal("unsupported instruction " + psprecomp::hex32(word) + " at " + psprecomp::hex32(pc) + ": " + reason);
+}
+
+void Runtime::arithmetic_overflow(std::uint32_t pc, std::uint32_t word) {
+    fatal("integer overflow exception at " + psprecomp::hex32(pc) + " (" + psprecomp::hex32(word) + ")");
+}
+
+void Runtime::fatal(const std::string &message) {
+    std::fprintf(stderr, "[fatal] %s\n", message.c_str());
+    if (auto *t = kernel_->current()) {
+        std::fprintf(stderr, "[fatal] in thread %d '%s'\n", t->uid, t->name.c_str());
+    }
+    std::fflush(stderr);
+    exit_program(70);
+}
+
+void Runtime::dump_threads() { kernel_->dump_threads(stderr); }
+
+void Runtime::exit_program(int code) {
+    std::fflush(stdout);
+    kernel_->exit_program(code);
+}
+
+void Runtime::kernel_host_poll(std::function<void()> poll) { kernel_->host_poll = std::move(poll); }
+std::uint64_t Runtime::now_us() const { return kernel_->now_us(); }
+void Runtime::skip_time(std::uint64_t us) { kernel_->skip_time(us); }
+void Runtime::exit_program_from_host(int code) { kernel_->request_exit(code); }
+
+void Runtime::log_unimplemented(const ImportEntry &import) {
+    const auto key = hle_key(import.library, import.nid);
+    if (!reported_unimplemented_[key]) {
+        reported_unimplemented_[key] = true;
+        std::fprintf(stderr, "[hle] unimplemented %s %s (returns 0)\n", import.library,
+                     psprecomp::hex32(import.nid).c_str());
+    }
+}
+
+void call_import(Runtime &rt, Context &ctx, ImportEntry &import) {
+    if (import.hle == nullptr) {
+        import.hle = rt.find_hle(import.library, import.nid);
+    }
+    if (import.hle == nullptr) {
+        rt.log_unimplemented(import);
+        ctx.gpr[2] = 0;
+        return;
+    }
+    if (rt.options().trace_imports) {
+        std::fprintf(stderr, "[hle] %s(%08X, %08X, %08X, %08X)\n", import.hle->name, ctx.gpr[4], ctx.gpr[5],
+                     ctx.gpr[6], ctx.gpr[7]);
+    }
+    rt.note_import(import.hle->name);
+    import.hle->handler(rt, ctx);
+}
+
+namespace hle {
+std::string read_string(Runtime &rt, std::uint32_t address, std::size_t max_length) {
+    if (address == 0) {
+        return {};
+    }
+    // Byte by byte, so an unterminated or out-of-range string is truncated instead of failing.
+    std::string out;
+    auto &mem = rt.memory();
+    for (std::size_t i = 0; i < max_length; ++i) {
+        if (!mem.contains(address + static_cast<std::uint32_t>(i), 1)) break;
+        const auto c = static_cast<char>(mem.load8(address + static_cast<std::uint32_t>(i)));
+        if (c == '\0') break;
+        out.push_back(c);
+    }
+    return out;
+}
+} // namespace hle
+
+} // namespace mhf::psp
+
+namespace mhf::psp::abi {
+
+psprecomp::GuestMemory &memory(Runtime &rt) noexcept { return rt.memory(); }
+void call(Runtime &rt, Context &ctx, std::uint32_t address) { rt.call(ctx, address); }
+void jump(Runtime &rt, Context &ctx, std::uint32_t address) { rt.jump(ctx, address); }
+void unsupported(Runtime &rt, std::uint32_t pc, std::uint32_t word, const char *reason) {
+    rt.unsupported(pc, word, reason);
+}
+void arithmetic_overflow(Runtime &rt, std::uint32_t pc, std::uint32_t word) { rt.arithmetic_overflow(pc, word); }
+HookFunction find_hook(Runtime &rt, const char *name) { return rt.find_hook(name); }
+void call_import(Runtime &rt, Context &ctx, ImportEntry &import) { mhf::psp::call_import(rt, ctx, import); }
+
+std::atomic<bool> interrupt_pending{false};
+
+void service_interrupts(Runtime &rt) {
+    interrupt_pending.store(false, std::memory_order_relaxed);
+    rt.kernel().service_from_thread();
+}
+
+} // namespace mhf::psp::abi

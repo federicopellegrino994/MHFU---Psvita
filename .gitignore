@@ -1,0 +1,8 @@
+build/
+user_data/
+*.iso
+*.cso
+*.pbp
+*.vpk
+*.self
+*.elf

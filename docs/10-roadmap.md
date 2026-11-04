@@ -1,0 +1,208 @@
+# 10 — Roadmap
+
+Each milestone has verifiable acceptance criteria. Mark `[x]` when done with date/PR.
+
+## Experimental Vita branch (2026-11-02)
+
+Game preparation checkpoint:
+- Player's EU executable prepared and SHA-1 matched the reference.
+- DATA.BIN: 6657 entries; all 298 extracted overlay SHA-256 values match EU metadata.
+- Actual recompiler emitted 3372 executable functions (271911 instructions,
+  98.8% reported coverage, 15 unresolved jumps) and 18365 overlay functions
+  (1231411 instructions, 78.3% reported coverage, 298 unresolved jumps).
+- Generated sources remain private under ignored user_data/generated/ULES01213.
+  This is generation only, not a successful ARM build, link or game boot.
+- Vita syntax checks pass for runtime.cpp, hle_thread.cpp, hle_net.cpp,
+  hle_net_sockets.cpp, hle_mpeg.cpp, hle_ge.cpp and adhoc_sockets.cpp after
+  supplying their include directories. These do not verify linking or execution.
+- hle_io.cpp now uses checked fseek/ftell on Vita; its ARM syntax check passes.
+  Full HLE/media/network libraries, GPU backend and real game execution remain pending.
+
+
+- [x] Standalone ARM32 diagnostic build and VPK packaging in `vita/`.
+- [x] Host integration tests: 8 synthetic disc cases; PSP guest memory aliases,
+      VRAM mirrors, out-of-bounds rejection and FPU bit-conversion checks.
+- [x] On-device diagnostic execution and EU player-disc recognition (user photos).
+- [x] Vita SceFiber adapter cross-compiled; standalone cooperative switching check added.
+- [x] SceFiber 129-cycle test passed on the user's Vita/HENkaku 3.60 (photo).
+- [x] Real PSP Kernel and SysMem connected to a reduced native-callback test host.
+- [x] Scheduler test host passed on the user's Vita (0.3 photo).
+- [x] Self-authored Allegrex fixture passes through actual AOT emitter to C++; one delay import bridge.
+- [x] AOT fixture passed on Vita (0.4 user photo).
+- [x] Full Runtime/HLE/interpreter/GE static archive cross-compiled in offline mode.
+- [x] FFmpeg 7.1.5 H.264/ATRAC libraries built for ARM with pthreads and matching enum ABI.
+- [x] Offline transport host contract test and 8 diagnostic regression cases pass.
+- [x] Full Runtime diagnostic linked and packaged as Pocket Probe 0.5 VPK.
+- [x] Pocket Probe 0.5 full Runtime execution on physical Vita (user photo and logs).
+- [ ] ARM compilation of all private generated game sources: target pocket_game_generated added; first build started, completion unverified.
+- [ ] Full host services and media integration.
+- [ ] Recompiled game boot, native GPU backend and measured quest performance.
+
+This branch does not run the game yet. See `vita/README.md` for scope, blockers
+and acceptance criteria. No resolution or frame-rate target has been validated.
+
+## Phase 0 — Foundations (no game needed)
+
+- [x] Repository skeleton: `core/`, `platforms/psp/`, `games/mhfu/` (region metadata), `tests/`, `LICENSE` (GPL-3.0-or-later), `.gitignore`,
+      `.gitattributes`, `THIRD_PARTY.md`, PSPRecomp vendored in `third_party/psprecomp/` (2026-10-16).
+- [x] Root CMake with presets `linux-clang`, `windows-clang`, `windows-msvc`; builds and passes tests on Linux (2026-10-16)
+      and on Windows (CI and the release build, 2026-10-19).
+- [x] GitHub Actions CI (content guard + build/test on Ubuntu and Windows) green on `main` since 2026-10-19.
+- [x] Content guard `scripts/check_repo_content.py` (paths, `~PSP`/PSF/ISO/PSMF signatures, MIPS ELF, size) + `.githooks/pre-commit`
+      (enable with `git config core.hooksPath .githooks`) (2026-10-16).
+- [x] pspdev toolchain in CI (Linux job) to build our own `homebrew/` (2026-10-16).
+- [x] Evaluate PSPRecomp, ACX recomp, N64Recomp and mhp2g-decomp (2026-10-16; summary in `04-recompiler.md` §1).
+**Acceptance**: CI green on both OSes building an empty executable and the homebrew.
+
+## Phase 1 — Minimal PSP runtime (on our own homebrew)
+
+- [x] `platforms/psp/tools`: ISO9660 reader, ELF loader (PSPRecomp), NID database `platforms/psp/hle/nids.csv` generated
+      from PSPSDK by `scripts/extract_nids.py` (2026-10-16). PRX relocation still pending.
+- [x] Recompiler `mhf_recomp` (function-level, `04` §5): ALU, memory, delay slots, likely branches, calls, tail calls, jump
+      tables, non-local returns, FPU, VFPU (PSPRecomp semantics + additions). `cputest` 100/100 (2026-10-16).
+- [x] Recompiler + runtime: overlays analyzed together with the executable, overlay-aware lookup, hooks by canonical
+      name (`04` §4.4) (2026-10-16).
+- [x] Runtime `mhf_psp_runtime`: guest memory, fibers + scheduler, threads, semaphores, event flags, lwmutex, SysMem,
+      IoFileMgr/Stdio over host folders, sceDisplay/sceCtrl (headless), sceRtc, UtilsForUser, scePower, LoadExec.
+      `hello` and `threadtest` 17/17 pass natively on Linux (2026-10-16).
+- [x] `core`: SDL3 window, input and audio output (`core/host/sdl_host.cpp`, 2026-10-16).
+- [x] GE software renderer covering through mode and 3D (`05` §6); `getest` checks pixels (2026-10-16).
+- [x] Interpreter fallback for code the analysis did not reach (`04` §7), VFPU included; every homebrew test also runs
+      fully interpreted (`MHF_INTERPRET_ONLY=1`) (2026-10-16).
+**Acceptance**: hello/ctrltest run natively on Windows and Linux; cputest passes 100 %.
+
+## Phase 2 — Freedom Unite to the main menu (ULES01213)
+
+- [x] Dump hashes, `PARAM.SFO`, `BOOT.BIN` state (zeros) — 2026-10-16.
+- [x] Decrypted executable available in `user_data/exe/` — 2026-10-16.
+- [x] Import inventory: 272 functions / 34 libraries (`05` §1) — 2026-10-16.
+- [ ] Local Ghidra project + MCP (`09`).
+- [x] `DATA.BIN` container + overlay format understood; developer-only extractor `mhfu_extract_overlays` with synthetic tests;
+      298 EU overlays extracted and validated (0 undecodable instructions); manifest versioned (2026-10-16).
+- [x] Overlay loader located in the EU executable (request/finish/prepare, region table, active-slot array); hook point
+      `mh_overlay_prepare` recorded in `regions/ULES01213/symbols.toml` (2026-10-16).
+- [ ] Full VFPU in the recompiler + vfputest.
+- [x] GE (software): T&L, vertex formats, swizzled/CLUT/DXT textures, framebuffers in VRAM (2026-10-16).
+- [x] GE hardware renderer: OpenGL 3.3 behind the `gpu::Backend` interface, upscaling and render to texture
+      (2026-10-17; known gaps in `05` §6).
+- [ ] Vulkan backend (optional: OpenGL already covers Windows, Linux and the Deck).
+- [x] Developer build of the game: `games/mhfu/tools/prepare.py` + `-DMHF_MHFU_GENERATED=...` → `mhfu` executable that
+      reads the ISO directly (2026-10-16).
+- [x] `sceLibFont` over a free font (Liberation Sans + stb_truetype); menu and dialog text render (2026-10-16).
+- [x] Reaches the main menu, character creation (name via the keyboard stub) and the first save prompt with scripted
+      input (`--input`) (2026-10-16).
+- [ ] Local golden boot trace.
+**Acceptance**: boots, shows logos and reaches the main menu; input works; no fallback-interpreter use on that path.
+
+## Phase 3 — Single-player playable
+
+- [x] Audio: SAS + ATRAC3+ (music and effects) (2026-10-17). Remaining: SAS reverb.
+- [x] Pre-rendered movies (`sceMpeg`, `05` §5i, 2026-10-23): picture and sound, H.264 through FFmpeg's libavcodec and
+      ATRAC3+ through `libavcodec` (cmake/ffmpeg.cmake). Verified with the intro; the gallery plays through the same calls.
+      Remaining: the YCbCr decode path (`sceMpegAvcDecodeYCbCr`), which FU does not import, and seeking.
+- [x] Savedata (`sceUtility`) save/load/list/delete/sizes to plain folders, `homebrew/savetest` (2026-10-16).
+- [x] Our own UI for the save list, message dialog and on-screen keyboard (`05` §5h, 2026-10-18): drawn over the game,
+      gamepad and physical keyboard; verified in FU's character creation (name typed, autosave toast).
+- [ ] GE: stencil, color test, logic ops, CPU reads of framebuffers; Bézier/spline patches if used (gaps in `05` §6).
+- [ ] Overlays: stage and monster overlays dispatch correctly.
+- [ ] Village, shop, Felyne kitchen, one gathering quest and one hunting quest completed.
+- [ ] Performance measured on a modest PC and on Linux.
+- [x] Owner playtest (2026-10-21): single player played from start to finish on Windows. Fixed in 0.2.1: audio clicks (the
+      output device was fed 0.2 % too little, `psp_frontend.cpp`) and flicker of item icons, text and textures at 60 fps and
+      above (2D sprites are paired strictly, `05` §6). Fixed in 0.2.2: that pairing ignored the alternating draw buffer, so
+      the 2D HUD did not interpolate and the Linux interpolation test failed.
+      Known: 180 fps not sustained in the heaviest areas, saves are in the PSP format (import from a PSP or PPSSPP in Settings; usable in PPSSPP).
+**Acceptance**: complete 3 quests and save/load without failures; stable framerate matching the original.
+
+## Phase 4 — Launcher and packaging
+
+- [x] Gamepad-first launcher (`07` §3b, 2026-10-17): React/Motion UI in the system web view, add copy with SHA-1
+  verification, settings passed to the game, play time; friends/rooms UI waits for online play.
+- [x] Installer scaffolding (`07` §3b, 2026-10-19): per-user data folder, image checks, optional image copy, `MHForever --install`,
+  executable identity gate (size + SHA-1 in, SHA-1 out). Tests on a synthetic image, no game data.
+- [x] Executable preparation module: the decryption step behind `builtin_decryptor()` (PPSSPP's PRX decrypter, GPL), validated
+  byte for byte against `[dev_executable]` with the developer's disc (2026-10-19).
+- [x] Saves (`<Documents>/MHForever/saves/<DISC_ID>`) and `launcher.json` (`%APPDATA%/MHForever`) kept outside the program folder,
+      with a one-time copy from the old layout (0.2.1, 2026-10-22).
+- [x] Launcher: updates from the GitHub releases, checked against the SHA-256 GitHub publishes for each archive (2026-10-29).
+- [ ] Launcher: language selection.
+- [x] Windows zip with `scripts/package_release.py`; v0.1.0 published (2026-10-19), v0.2.0 adds frame interpolation (2026-10-21), v0.2.1 fixes audio clicks and keeps saves and settings outside the program folder (2026-10-22), v0.2.2 makes the 2D HUD interpolate again (2026-10-22), v0.2.3 makes interpolation lighter (about 90 to 150 fps in
+      the village at 180, 2026-10-22), v0.3.0 adds the in-game menu on Escape with live video and audio settings and
+      internal resolution up to 10x (2026-10-22), v0.4.0 uses the PSP save format: saves can be imported from a PSP or PPSSPP
+      and copied back (2026-10-22), v0.4.1 is the first release with a Linux tarball next to the Windows zip (2026-10-23), v0.4.2 plays the pre-rendered movies and decodes the music with FFmpeg, and edits the keyboard and controller buttons from the launcher and the in-game menu (2026-10-25), v0.5.0 adds the North American release: one program per region, a Library that chooses the copy, and video, audio and controls per copy under Game settings (2026-10-26), v0.6.0 brings online play on the PSP ad hoc servers PPSSPP uses: quests with other copies and with PPSSPP, a server picker in the launcher, and an in-game menu that no longer pauses (2026-10-27), v0.6.1 fixes a crash in the sound driver (the Shogun Ceanataur quest in the Swamp), shows the quest-end background and the level stars again, and lets the saves live in a folder of the player's choice (2026-10-28), v0.6.2 brings the quest-end background back and removes the particle fragments at high frame rates (2026-10-29), v0.7.0 adds the Japanese release (Portable 2nd G) with its Japanese text, and a launcher that updates itself from the GitHub releases (2026-10-29), v0.8.0 brings private rooms (a room code, made or joined in the launcher or the in-game menu, with the server switched in game too) and friends (added by code, over public Nostr relays: who is online and where, invites and joining), and a mouse-first in-game menu (2026-10-30), v0.8.1 makes frame interpolation match whole draws and draw them again, so the ground no longer tears above 30 fps and animated models move smoothly, and says at once when a friend is in your room (2026-10-30), v0.8.2 brings HD texture packs in PPSSPP's format (such as KHD), one per copy of the game in Game settings (2026-10-30).
+- [x] Linux release (2026-10-22): portable `MHForever-<version>-linux-x64.tar.gz` from
+      `scripts/package_release.py --platform linux` (programs, fonts, licenses, `dist/PLAYER_README_LINUX.txt`), embedded
+      application icon, and a `cmake --install` layout with the desktop entry and the icon. CI builds and packages the layout
+      on Ubuntu.
+- [ ] Windows installer and AppImage (Linux). Steam Deck: players have reported it working on SteamOS; the maintainers have no Deck to test on.
+**Acceptance**: a user with no development tools goes from "I have my ISO" to "I'm playing" using only the launcher.
+
+## Phase 5 — Multiplayer
+
+- Research 2026-10-27 (`13-online-plan.md`): how the game uses the network (PTP send is its only blocking call),
+  ranked causes of the quest-start freeze and the diagnostics that decide them, compatibility between regions and with
+  PPSSPP and real PSPs, private rooms on public servers, and the plan for 0.6, 0.7 and later.
+- The network layer is shared by every future console (3DS, Switch, PS2, Wii, Wii U): `core/net` offers rooms
+  (packets or inputs mode), each console adds an adapter (`08-multiplayer.md` §1.1).
+- [x] Harden HLE boundaries first (`08-multiplayer.md` §4.6): the Windows drive-letter path escape is fixed,
+  `host0:` is closed by default, and the GE and HLE guest memory bounds were checked (2026-10-23). Fuzzing comes with the
+  net HLE.
+- First transport: the community's ad hoc servers (PPSSPP/aemu), decided 2026-10-23 (`08-multiplayer.md` §1.2).
+- [x] Vendor the aemu_postoffice client; PSP adapter (`sceNetAdhoc*`, `sceNetAdhocctl*`, `sceNetAdhocDiscover*`) with
+  tracing, tested against the reference server (2026-10-23, `05-runtime-hle.md` §5i). Two copies of the game, and the game with
+  PPSSPP, see each other in the Gathering Hall (2026-10-24).
+- [x] Two instances on one PC complete a quest through a local server (2026-10-27). The freeze at the start of a quest
+  had two causes: the fallback interpreter treated a jump into a jump-table case that the analysis had taken for a
+  function as a tail call and dropped the caller's frame, and `sceNetAdhocPtpOpen` checked the wrong arguments and
+  refused the flag the game passes, so the guest could not reach the host and gave it up (`13-online-plan.md` §7, E1).
+- [x] Quests with PPSSPP on a public server (socom.cc), with either side leading the quest (2026-10-27, E3).
+- [x] Launcher: Settings → Online picks the server (Offline, five community servers from PPSSPP's list with their ping, or
+  any host), stable virtual MAC, pseudonym, and the privacy note (2026-10-27). The in-game menu no longer pauses the
+  game, so opening it does not drop the player from a quest (2026-10-27, E6). **Released in 0.6.0.**
+- [ ] Before the launcher reads PPSSPP's server list itself: write to PPSSPP and the server operators (`08-multiplayer.md`
+  section 1.2; drafts kept outside the repository). Then the remaining experiments of `13-online-plan.md` §7: EU with
+  NA (E2), three and four players (E4), two networks (E5), Linux (E8), fuzzing (E9).
+- [x] Private rooms: room codes that rename the game's 24 halls on any public server (`14-rooms-and-friends.md` §3).
+  **Released in 0.8.0** (PR #33).
+- [x] Friends: friend codes, presence, invites and join over Nostr relays (`14-rooms-and-friends.md` §4). **Released in 0.8.0**
+  (PR #34). Discord Rich Presence is still not done (optional).
+**Acceptance**: 4 players (Windows + Linux/Deck, different networks) complete a quest together.
+
+## Phase 6 — US and JP regions
+
+- [x] ULUS10391 (North America, 2026-10-26): `symbols.toml` (found by matching the EU functions byte for byte) and `overlays.toml`
+      (298 overlays); recompiled to its own program (`mhfu-us`), checked by playing: intro with sound, controller, village
+      with music, save and load.
+- [x] Launcher: one program per region, a Library that chooses the copy, and video, audio and controls per copy.
+- [x] ULJM05500 (Japan, 2026-10-29): `symbols.toml` and `overlays.toml` (298 overlays); recompiled to its own program
+      (`mhfu-jp`); Japanese text through a second free font (Noto Sans JP). Checked headless: intro, title menu and
+      character creation; then checked by playing (2026-10-29): it plays as the European release does.
+- [ ] Symbol-coverage test.
+**Acceptance**: all three regions meet phase 3 criteria.
+
+## Phase 7 — Optional enhancements
+
+Done: internal resolution (`--scale`, launcher setting), bilinear texture option, right stick as D-pad camera, fullscreen toggle.
+Done too: 60 to 180 fps by frame interpolation (`--fps`, launcher setting; `05-runtime-hle.md` §6, v0.2.0).
+Done too: HD texture packs in PPSSPP's format, one per copy of the game, in Game settings (0.8.2; `05-runtime-hle.md`, texture packs).
+Done too: an in-game menu on Escape (pause, blurred full-screen backdrop, tabs, mouse, controller) that changes the volumes,
+internal resolution (1x to 10x), frame rate, fullscreen and texture smoothing while playing (`07-launcher-ux.md` §3c).
+Done too: the keyboard bindings are chosen in the launcher (Settings → Controls; `07-launcher-ux.md` §5), and so are the
+controller's buttons and stick; both can also be changed from the in-game menu (Controls tab) and are kept (2026-10-23).
+Pending: widescreen, analog camera hook, per-controller profiles, per-controller icons, vsync, and in-between
+pictures made on a thread of their own:
+the GE runs the game's display lists (about 10 ms per frame in heavy scenes) on the same thread, which caps 180 fps at
+about 150 there (measured with `MHF_PROFILE=1`, 0.2.3). See `06-mhfu-module.md` §9.
+
+## Phase 8 — Next game
+
+Portable 3rd or Freedom 2/Freedom (PSP), reusing the runtime. Then PS2 (Monster Hunter 1/G/2 "Dos") once PS2Recomp is usable, and
+3DS (MH4U, Generations) once a base exists.
+
+## Backlog / ideas
+
+- Import PSP/PPSSPP saves (careful: save encryption).
+- Local "download server" for event quests the player already owns (`05` §1, P3).
+- Recording, voice chat.
+- macOS/ARM64 ports.
+- Clean, progressive reimplementation of modules (camera, UI, network) to depend less on translated code.

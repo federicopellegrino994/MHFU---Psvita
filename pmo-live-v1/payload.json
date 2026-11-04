@@ -1,0 +1,48 @@
+{
+  "files": {
+    "platforms/psp/gpu/ge.hpp": {
+      "before": [
+        "62ca904fc96d51a72de89bebd25afc5e74591d73818cdde05e3970217f2d9b07"
+      ],
+      "after": "e9282e9c9f55e8224e303f1720919a31f2472749991c330308e520d4431c6c2f"
+    },
+    "platforms/psp/gpu/ge.cpp": {
+      "before": [
+        "4e41a68694bc9a03d168a6b0185a06e87bbc281e07d2821297f2b8601d8a3b41"
+      ],
+      "after": "6054886467cfabe860634b5080438c476e31eda05cca96efa97495103b8352fa"
+    },
+    "platforms/psp/gpu/backend.hpp": {
+      "before": [
+        "3df7c2114c88ae6d1021d77889e3bb773d4ebec588499eaa75bf219b20d49b27"
+      ],
+      "after": "d0a252b3703e2a26e24adace3a6466dd4713096dd275b92bf13bd5b66a7fcba2"
+    },
+    "platforms/psp/gpu/pocket_pmo_bridge.hpp": {
+      "before": [
+        null
+      ],
+      "after": "b1edac445e447f8dbf90ba4ef814ca5b79bc83d9a5913c86b26fcaf992ae944f"
+    },
+    "platforms/psp/gpu/pocket_native_geometry.hpp": {
+      "before": [
+        null
+      ],
+      "after": "4448891f5f1542a8d006a66119e9a8cbe82840b791b443c572176625eb7d25cd"
+    },
+    "platforms/psp/gpu/pocket_native_pmo.hpp": {
+      "before": [
+        null
+      ],
+      "after": "e337beefdf5f58066432590a2031cb3fa26c1cde445d53f194c60645f1146792"
+    },
+    "vita/runtime/vita_gpu.cpp": {
+      "before": [
+        "f9dc5ecadefbffc2306d2b7e25773da5530759a2bc0fe5919164404d3a4ecb24",
+        "851d2ca0939eea4e4de4c932ef657763f736a6c7658c051d0a23ce52fb864f23"
+      ],
+      "after": "5249b6460dcf8db436164d54eff4f043850fe04f80ed6c0498dc001cf49aa44a"
+    }
+  },
+  "resident_header_sha256": "53cca7f23139179c749ff945f8ef1cb8d891dc639c10831a64d159f7f6faec1a"
+}

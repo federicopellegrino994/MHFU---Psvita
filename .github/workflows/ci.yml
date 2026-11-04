@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run pointless: cancel it instead of queueing behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  content-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check for game data or derived content
+        run: python3 scripts/check_repo_content.py
+
+  build:
+    needs: content-guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            preset: linux-clang
+          - os: windows-2022
+            preset: windows-clang
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libasound2-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev \
+            libavcodec-dev libavutil-dev
+      - name: Install pspdev toolchain for our homebrew tests (Linux)
+        if: runner.os == 'Linux'
+        env:
+          PSPDEV_RELEASE: v20261001
+          PSPDEV_SHA256: a86efe624e770005290919617859e9df24bd8fcd3e364f4587f23ec7364b0acd
+        run: |
+          curl -sSfL -o pspdev.tar.gz \
+            "https://github.com/pspdev/pspdev/releases/download/${PSPDEV_RELEASE}/pspdev-ubuntu-latest-x86_64.tar.gz"
+          echo "${PSPDEV_SHA256}  pspdev.tar.gz" | sha256sum --check -
+          sudo tar xzf pspdev.tar.gz -C /opt
+          rm pspdev.tar.gz
+          echo "PSPDEV=/opt/pspdev" >> "$GITHUB_ENV"
+      - name: Compiler cache (Linux)
+        if: runner.os == 'Linux'
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: build-${{ matrix.preset }}
+          max-size: 1G
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake --preset ${{ matrix.preset }} -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+      - name: Package the Linux release layout
+        if: runner.os == 'Linux'
+        run: |
+          cp build/linux-clang/core/mhf /tmp/mhfu
+          python3 scripts/package_release.py --platform linux \
+            --launcher build/linux-clang/launcher/MHForever --game /tmp/mhfu \
+            --fonts third_party/fonts/liberation-sans --out /tmp/mhf-release
+          # The archive, the core program and CMakeLists.txt must agree on the version.
+          version=$(build/linux-clang/core/mhf --version)
+          test -f "/tmp/mhf-release/MHForever-${version}-linux-x64.tar.gz"
+          tar tzf "/tmp/mhf-release/MHForever-${version}-linux-x64.tar.gz"
+
+  # AddressSanitizer + UndefinedBehaviorSanitizer over the whole test suite.
+  sanitizers:
+    needs: content-guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang libclang-rt-18-dev pkg-config libwebkit2gtk-4.1-dev \
+            libgtk-3-dev libasound2-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev \
+            libavcodec-dev libavutil-dev
+      - name: Install pspdev toolchain for our homebrew tests
+        env:
+          PSPDEV_RELEASE: v20261001
+          PSPDEV_SHA256: a86efe624e770005290919617859e9df24bd8fcd3e364f4587f23ec7364b0acd
+        run: |
+          curl -sSfL -o pspdev.tar.gz \
+            "https://github.com/pspdev/pspdev/releases/download/${PSPDEV_RELEASE}/pspdev-ubuntu-latest-x86_64.tar.gz"
+          echo "${PSPDEV_SHA256}  pspdev.tar.gz" | sha256sum --check -
+          sudo tar xzf pspdev.tar.gz -C /opt
+          rm pspdev.tar.gz
+          echo "PSPDEV=/opt/pspdev" >> "$GITHUB_ENV"
+      # Everything is compiled with ASan/UBSan here (about 25 minutes from scratch); the cache keeps what did not change.
+      - name: Compiler cache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: sanitizers
+          max-size: 2G
+      - name: Configure
+        run: cmake --preset linux-clang-asan -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build --preset linux-clang-asan
+      - name: Test
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --preset linux-clang-asan
