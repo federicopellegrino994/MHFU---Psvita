@@ -13,9 +13,15 @@ class GeometryProbe {
     std::array<std::uint64_t,8> primitives_{};
     std::uint64_t lists_{}, info_{}, verts_{}, assembly_{};
     bool enabled_=false, active_=false; // Detailed census disabled for performance testing.
+    // POCKET_CENSUS_V6: opt-in with ux0:data/pocketprobe/census.flag; bone uploads and CALL/PMO counters.
+    std::uint64_t bone_uploads_{}, calls_{}, pmo_known_{}, pmo_lit_{};
 public:
     GeometryProbe() {
 #if defined(__vita__)
+        if(FILE *f=std::fopen("ux0:data/pocketprobe/census.flag","rb")) {
+            std::fclose(f); enabled_=true;
+            std::fprintf(stderr,"[ge-census] v6 enabled by census.flag; 1 frame in 30 is measured\n");
+        }
         if(FILE *f=std::fopen("ux0:data/pocketprobe/no-census.flag","rb")) {
             std::fclose(f); enabled_=active_=false;
             std::fprintf(stderr,"[ge-census] disabled by no-census.flag\n");
@@ -23,6 +29,8 @@ public:
 #endif
     }
     bool active() const noexcept {return active_;}
+    void bone_upload() noexcept {if(active_)++bone_uploads_;}
+    void call(bool pmo_known,bool pmo_lit) noexcept {if(!active_)return;++calls_;pmo_known_+=pmo_known;pmo_lit_+=pmo_lit;}
     void record(unsigned vt,unsigned prim,unsigned count,unsigned stride,unsigned flags) {
         if(!active_)return;
         ++draws_;vertices_+=count;small_+=count<=8;++primitives_[prim&7];
@@ -44,15 +52,16 @@ public:
             const auto u=[](std::uint64_t n){return static_cast<unsigned>(n);};
             std::fprintf(stderr,"[ge-census] frame=%u draws=%u vertices=%u small_draws_le8=%u simple3d_vertices=%u overflow_draws=%u\n",u(frames_),u(draws_),u(vertices_),u(small_),u(simple_),u(overflow_));
             std::fprintf(stderr,"[ge-census-time] measured CPU wall ms: lists=%.3f info=%.3f vertices=%.3f assembly=%.3f; includes instrumentation; excludes present\n",lists_/1e6,info_/1e6,verts_/1e6,assembly_/1e6);
+            std::fprintf(stderr,"[ge-census-bones] bone_matrix_uploads=%u calls=%u pmo_groups=%u pmo_groups_lit=%u\n",u(bone_uploads_),u(calls_),u(pmo_known_),u(pmo_lit_));
             std::fprintf(stderr,"[ge-census-prims] points=%u lines=%u line_strip=%u triangles=%u tri_strip=%u tri_fan=%u sprites=%u other=%u\n",u(primitives_[0]),u(primitives_[1]),u(primitives_[2]),u(primitives_[3]),u(primitives_[4]),u(primitives_[5]),u(primitives_[6]),u(primitives_[7]));
             std::array<unsigned,64> order{};for(unsigned i=0;i<used_;++i)order[i]=i;
             std::sort(order.begin(),order.begin()+used_,[&](unsigned a,unsigned b){return buckets_[a].vertices>buckets_[b].vertices;});
             for(unsigned i=0;i<std::min(used_,12u);++i){const auto &b=buckets_[order[i]];const unsigned vt=b.vt;
-                std::fprintf(stderr,"[ge-census-format] vtype=%06X stride=%u through=%u weight_fmt=%u weights=%u morphs=%u pos_fmt=%u normal_fmt=%u uv_fmt=%u color_fmt=%u index_fmt=%u lighting=%u texgen=%u textured=%u fog=%u clear=%u draws=%u vertices=%u vertex_ms=%.3f\n",vt,b.stride,(vt>>23)&1,(vt>>9)&3,((vt>>9)&3)?((vt>>14)&7)+1:0,((vt>>18)&7)+1,(vt>>7)&3,(vt>>5)&3,vt&3,(vt>>2)&7,(vt>>11)&3,b.flags&1,(b.flags>>1)&3,(b.flags>>3)&1,(b.flags>>4)&1,(b.flags>>5)&1,u(b.draws),u(b.vertices),b.ns/1e6);
+                std::fprintf(stderr,"[ge-census-format] vtype=%06X stride=%u through=%u weight_fmt=%u weights=%u morphs=%u pos_fmt=%u normal_fmt=%u uv_fmt=%u color_fmt=%u index_fmt=%u lighting=%u lights=%u texgen=%u textured=%u fog=%u clear=%u draws=%u vertices=%u vertex_ms=%.3f\n",vt,b.stride,(vt>>23)&1,(vt>>9)&3,((vt>>9)&3)?((vt>>14)&7)+1:0,((vt>>18)&7)+1,(vt>>7)&3,(vt>>5)&3,vt&3,(vt>>2)&7,(vt>>11)&3,b.flags&1,(b.flags>>6)&7,(b.flags>>1)&3,(b.flags>>3)&1,(b.flags>>4)&1,(b.flags>>5)&1,u(b.draws),u(b.vertices),b.ns/1e6);
             }
         }
         active_=frames_%30==0;
-        if(active_){buckets_={};used_=0;current_=64;draws_=vertices_=small_=overflow_=simple_=0;primitives_={};lists_=info_=verts_=assembly_=0;}
+        if(active_){buckets_={};used_=0;current_=64;draws_=vertices_=small_=overflow_=simple_=0;primitives_={};lists_=info_=verts_=assembly_=0;bone_uploads_=calls_=pmo_known_=pmo_lit_=0;}
     }
 };
 }

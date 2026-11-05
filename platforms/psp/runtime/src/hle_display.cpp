@@ -4,11 +4,18 @@
 
 #include <cstdio>
 #include "kernel.hpp"
+#include "interpreter.hpp"
 
 #if defined(_WIN32)
 #include <windows.h>
 #else
 #include <time.h>
+#endif
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
+// POCKET_THREAD_REPORT_V8: exported by SceLibKernel (already linked); recent vita-headers only declare the raw variant.
+extern "C" int sceKernelGetThreadInfo(SceUID thid, SceKernelThreadInfo *info);
 #endif
 
 #include "mhf/psp/host.hpp"
@@ -78,6 +85,8 @@ void DisplaySetFrameBuf(Runtime &rt, Context &ctx) {
                      100.0 * static_cast<double>(ge_cpu - last_ge_cpu) / (seconds * 1e6));
         last_game_cpu = game_cpu;
         last_ge_cpu = ge_cpu;
+        thread_report("game");
+        interpreter_report();
         static std::uint64_t last_transform = 0, last_assemble = 0;
         const std::uint64_t transform = ge_detail().transform_us.load(std::memory_order_relaxed);
         const std::uint64_t assemble = ge_detail().assemble_us.load(std::memory_order_relaxed);
@@ -269,9 +278,11 @@ std::uint64_t thread_cpu_us() {
     };
     return (to_100ns(kernel) + to_100ns(user)) / 10u;
 #elif defined(__vita__)
-    // CPU-time telemetry is unavailable until a Vita counter is validated.
-    // Do not substitute wall time (which would count scheduler waits as CPU).
-    return 0;
+    // POCKET_THREAD_REPORT_V8: run time the kernel accounts to this thread (runClocks), not wall time.
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    if (sceKernelGetThreadInfo(sceKernelGetThreadId(), &info) < 0) return 0;
+    return static_cast<std::uint64_t>(info.runClocks);
 #else
     timespec ts{};
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
@@ -282,6 +293,34 @@ std::uint64_t thread_cpu_us() {
 GeDetail &ge_detail() {
     static GeDetail detail;
     return detail;
+}
+
+void thread_report(const char *name) {
+#if defined(__vita__)
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    const int rc = sceKernelGetThreadInfo(sceKernelGetThreadId(), &info);
+    if (rc < 0) { std::fprintf(stderr, "[thread] %s: sceKernelGetThreadInfo failed %08X\n", name, static_cast<unsigned>(rc)); return; }
+    // Deltas since this thread's previous report (each thread reports for itself).
+    thread_local std::uint64_t last_wall = 0, last_run = 0;
+    thread_local unsigned last_preempt = 0, last_intr = 0, last_release = 0, last_change = 0;
+    const std::uint64_t wall = sceKernelGetProcessTimeWide();
+    const std::uint64_t run = static_cast<std::uint64_t>(info.runClocks);
+    if (last_wall != 0) {
+        std::fprintf(stderr, "[thread] %s prio=0x%X affinity=0x%X/0x%X cpu=%d last_cpu=%d wall_ms=%.0f run_delta=%llu "
+                     "preempt=%u intr_preempt=%u release=%u cpu_changes=%d\n",
+                     name, static_cast<unsigned>(info.currentPriority), static_cast<unsigned>(info.initCpuAffinityMask),
+                     static_cast<unsigned>(info.currentCpuAffinityMask), info.currentCpuId, info.lastExecutedCpuId,
+                     static_cast<double>(wall - last_wall) / 1000.0, static_cast<unsigned long long>(run - last_run),
+                     info.threadPreemptCount - last_preempt, info.intrPreemptCount - last_intr,
+                     info.threadReleaseCount - last_release, info.changeCpuCount - static_cast<int>(last_change));
+    }
+    last_wall = wall; last_run = run;
+    last_preempt = info.threadPreemptCount; last_intr = info.intrPreemptCount;
+    last_release = info.threadReleaseCount; last_change = static_cast<unsigned>(info.changeCpuCount);
+#else
+    (void)name;
+#endif
 }
 
 std::atomic<std::uint64_t> &ge_thread_cpu_us() {

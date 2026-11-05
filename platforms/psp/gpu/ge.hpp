@@ -158,6 +158,50 @@ private:
     [[nodiscard]] Vertex transform(const DecodedVertex &in) const;
     void light(const float world_pos[3], const float world_normal[3], Vertex &out, const DecodedVertex &in) const;
 
+    // POCKET_CPU_XFORM_V5: transform and lighting constants that only change when their registers change. They are
+    // rebuilt lazily (first vertex after a write) instead of being re-derived from the raw registers for every vertex.
+    struct XformCache {
+        float clip[16]{};          // projection * view * world, column-major 4x4, applied to (model, 1)
+    };
+    struct LightCache {
+        struct One {
+            unsigned kind{}, comp{};            // kind: 0 directional, 1 point, 2 spot; comp: 0 diffuse, 1 +specular, 2 powered
+            float pos[3]{}, dir[3]{}, att[3]{};
+            float unit[3]{};                    // directional lights: normalized pos, fixed for the whole draw
+            float inv_dir_length{};             // 1 / |dir| (0 when the direction is zero)
+            float cutoff{}, spot_exp{};
+            float lac[4]{}, ldc[4]{}, lsc[4]{};
+        };
+        float emissive[4]{}, global[4]{}, ambient[4]{}, diffuse[4]{}, specular[4]{};
+        float base_r{}, base_g{}, base_b{}, base_a{};   // emissive + global * ambient / 255 (no vertex color)
+        std::uint32_t update{};
+        bool reverse{}, separate{};
+        float shininess{};
+        unsigned count{};
+        std::array<One, 4> light{};
+    };
+    // POCKET_CPU_XFORM_V5: how to read one vertex of the current VTYPE (offsets, formats, scale factors), computed once
+    // per VTYPE change. Morphing (several source vertices per vertex) keeps the generic reader.
+    struct DecodePlan {
+        std::uint32_t vt{~0u};
+        unsigned size{}, morphs{}, nweights{};
+        unsigned w_off{}, w_fmt{}, tc_off{}, tc_fmt{}, col_off{}, col_fmt{}, n_off{}, n_fmt{}, p_off{}, p_fmt{};
+        float w_scale{}, tc_scale{}, n_scale{}, p_scale{};
+        bool through{};
+    };
+    void rebuild_plan(std::uint32_t vt) const;
+    mutable DecodePlan plan_;
+    // Viewport and screen offset as floats, rebuilt when one of those registers is written.
+    struct ViewportCache { float xs{}, ys{}, zs{}, xc{}, yc{}, zc{}, ox{}, oy{}; };
+    mutable bool viewport_dirty_ = true;
+    mutable ViewportCache viewport_cache_;
+    void rebuild_viewport() const;
+    void rebuild_xform() const;
+    void rebuild_light() const;
+    mutable bool xform_dirty_ = true, light_dirty_ = true;
+    mutable XformCache xform_cache_;
+    mutable LightCache light_cache_;
+
     // Rasterizer.
     void draw_triangle(const Vertex &a, const Vertex &b, const Vertex &c);
     void draw_triangle_screen(const Vertex &a, const Vertex &b, const Vertex &c);

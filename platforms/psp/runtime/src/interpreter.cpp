@@ -6,6 +6,10 @@
 #include "interpreter.hpp"
 
 #include "kernel.hpp"
+#include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
 
 #include "mhf/psp/abi.hpp"
 
@@ -24,6 +28,11 @@ namespace mhf::psp {
 
 namespace {
 
+// POCKET_GAME_PHASES_V10: interpreted instructions and per-entry statistics. Every fiber runs on the game's host
+// thread, so these are only touched by that thread.
+std::uint64_t g_interp_instructions = 0;
+struct InterpStat { std::uint64_t calls{}, instructions{}; };
+std::unordered_map<std::uint32_t, InterpStat> g_interp_stats;
 std::atomic<std::uint32_t> g_last_backward{0}; // where the interpreter last jumped backwards, for the stall watchdog
 
 using psprecomp::DecodedInstruction;
@@ -258,6 +267,7 @@ struct Interpreter {
     // Returns true when the call was made natively (the caller continues after it).
     bool native_call(std::uint32_t target) {
         if (const GuestFunction f = rt.lookup(target & 0x3FFFFFFFu)) {
+            pocket::phase::GameScope native_phase(pocket::phase::GameRun);
             f(rt, ctx);
             return true;
         }
@@ -269,6 +279,7 @@ struct Interpreter {
         const std::uint32_t entry_sp = ctx.gpr[29];
         std::uint32_t pc = entry;
         for (;;) {
+            ++g_interp_instructions; // POCKET_GAME_PHASES_V10 (game thread only)
             const auto d = psprecomp::decode_allegrex(mem.load32(pc));
             if (!d.has_delay_slot() && d.kind != K::Jr && d.kind != K::Jalr) {
                 exec(d, pc);
@@ -349,7 +360,29 @@ void interpret_call(Runtime &rt, Context &ctx, std::uint32_t address) {
         std::fprintf(stderr, "[interp] interpreting %08X (called from $ra=%08X): not reached by the static analysis\n",
                      address, ctx.gpr[31]);
     }
+    pocket::phase::GameScope interp_phase(pocket::phase::GameInterp);
+    const std::uint64_t before = g_interp_instructions;
     Interpreter{rt, ctx, rt.memory()}.run(address & 0x3FFFFFFFu);
+    auto &stat = g_interp_stats[address & 0x3FFFFFFFu];
+    ++stat.calls;
+    stat.instructions += g_interp_instructions - before; // inclusive of code interpreted in place below it
+}
+
+void interpreter_report() {
+    static std::uint64_t last_total = 0;
+    const std::uint64_t total = g_interp_instructions - last_total;
+    last_total = g_interp_instructions;
+    std::vector<std::pair<std::uint32_t, InterpStat>> top(g_interp_stats.begin(), g_interp_stats.end());
+    std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second.instructions > b.second.instructions; });
+    char line[768];
+    int n = std::snprintf(line, sizeof line, "[interp-stats] instructions=%llu entries=%u top:",
+                          static_cast<unsigned long long>(total), static_cast<unsigned>(g_interp_stats.size()));
+    for (std::size_t i = 0; i < top.size() && i < 8 && n > 0 && n < int(sizeof line); ++i)
+        n += std::snprintf(line + n, sizeof line - n, " %08X calls=%llu instr=%llu", top[i].first,
+                           static_cast<unsigned long long>(top[i].second.calls),
+                           static_cast<unsigned long long>(top[i].second.instructions));
+    std::fprintf(stderr, "%s\n", line);
+    g_interp_stats.clear();
 }
 
 } // namespace mhf::psp

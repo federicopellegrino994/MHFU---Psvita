@@ -12,6 +12,7 @@
 #include "mhf/psp/host.hpp"
 
 #include "ge.hpp"
+#include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
 
 #include <chrono>
 #include <atomic>
@@ -180,10 +181,13 @@ struct GeState {
             }
         }
         hle::profiler_register_thread("drawing");
+        pocket::phase::start_sampler();
+        pocket::phase::ge_phase.store(pocket::phase::GeLoop, std::memory_order_relaxed);
         std::unique_lock lock(mutex);
         // Waits for work, but not past the moment the backend wants to be called (a second picture for a flip).
         const auto wait_for_work = [&] {
             const auto due = backend ? backend->next_wakeup() : std::nullopt;
+            pocket::phase::GeScope idle_phase(pocket::phase::GeIdle);
             if (due) wake.wait_until(lock, *due);
             else wake.wait(lock);
         };
@@ -197,8 +201,13 @@ struct GeState {
             const DisplayList &l = lists[id];
             return id == stalled_id && l.pc == stalled_pc && l.stall == stalled_stall;
         };
+        auto thread_report_due = std::chrono::steady_clock::now(); // POCKET_THREAD_REPORT_V8
         while (!stop) {
             hle::ge_thread_cpu_us().store(hle::thread_cpu_us(), std::memory_order_relaxed);
+            if (const auto now = std::chrono::steady_clock::now(); now >= thread_report_due) {
+                hle::thread_report("ge");
+                thread_report_due = now + std::chrono::seconds(5);
+            }
             hle::ge_detail().transform_us.store(renderer().stats().transform_ns / 1000u, std::memory_order_relaxed);
             hle::ge_detail().assemble_us.store(renderer().stats().assemble_ns / 1000u, std::memory_order_relaxed);
             if (backend) {
@@ -300,6 +309,11 @@ GeState &ge(Runtime &rt) {
 // Blocks the calling guest thread until `done()` holds, polling every 100 us (the worker cannot wake guest threads).
 template <typename Done>
 void wait_for_ge(Runtime &rt, Done done) {
+    // POCKET_PHASE_PROBE_V9: while a fiber waits here, scheduler idle time counts as waiting for the GE.
+    struct Waiting {
+        Waiting() { pocket::phase::game_waiting_ge.fetch_add(1, std::memory_order_relaxed); }
+        ~Waiting() { pocket::phase::game_waiting_ge.fetch_sub(1, std::memory_order_relaxed); }
+    } waiting;
     while (!done()) {
         rt.kernel().wait(Kernel::WaitType::Delay, 0, rt.kernel().now_us() + 100u);
     }

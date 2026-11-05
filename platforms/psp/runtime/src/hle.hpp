@@ -87,6 +87,8 @@ PerfCounters &perf();
 
 // CPU time used so far by the calling thread, in microseconds (0 where the system cannot tell).
 std::uint64_t thread_cpu_us();
+// POCKET_THREAD_REPORT_V8: on the Vita, prints the calling thread's priority, cores and run time (every call; rate-limit at the caller).
+void thread_report(const char *name);
 // Published by the GE worker thread every time around its loop, read when the "[perf]" line is printed.
 std::atomic<std::uint64_t> &ge_thread_cpu_us();
 // Where the display lists spend their time (Ge::Stats), published by the GE worker next to the CPU time.

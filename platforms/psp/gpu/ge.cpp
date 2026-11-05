@@ -1,4 +1,5 @@
 #include "ge.hpp"
+#include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
 #define XXH_INLINE_ALL
 #include "../../../third_party/xxhash/xxhash.h"
 
@@ -90,7 +91,7 @@ void mul43(const Matrix43 &m, const float in[3], float out[3], float w = 1.0f) {
     }
 }
 
-void mul44(const Matrix44 &m, const float in[4], float out[4]) {
+[[maybe_unused]] void mul44(const Matrix44 &m, const float in[4], float out[4]) {
     for (int i = 0; i < 4; ++i) {
         out[i] = in[0] * m.m[static_cast<std::size_t>(i)] + in[1] * m.m[static_cast<std::size_t>(4 + i)] +
                  in[2] * m.m[static_cast<std::size_t>(8 + i)] + in[3] * m.m[static_cast<std::size_t>(12 + i)];
@@ -133,6 +134,7 @@ Ge::Ge(psprecomp::GuestMemory &memory) {
         std::fclose(flag);
         transform_cache_enabled_ = false;
     }
+    std::fprintf(stderr, "[cpu-xform] v5 enabled; lazy light/matrix caches, per-VTYPE decoder, command flag table\n");
     std::fprintf(stderr, "[cpu-transform-cache] v4 %s; 256 entries, exact source bytes\n",
                  transform_cache_enabled_ ? "enabled" : "disabled");
 #endif
@@ -144,6 +146,12 @@ Ge::Ge(psprecomp::GuestMemory &memory) {
 // Native PMO groups are opt-in for a non-interpolating backend. Unsupported
 // state, source mutation, stalls and command patterns keep the legacy list.
 bool Ge::native_group(std::uint32_t target,std::uint32_t stall) {
+    pocket::phase::GeScope pmo_phase(pocket::phase::GePmo);
+    if(geometry_probe_.active() && backend_) { // POCKET_CENSUS_V6: are lit models native PMO groups?
+        pocket::pmo::Region known_region;
+        const bool known=pocket::pmo::registry.get(target,known_region);
+        geometry_probe_.call(known, known && (regs_[kLightingEnable]&1u));
+    }
     if(!backend_ || !backend_->supports_native_pmo() || !pocket::pmo::live_enabled() ||
        (regs_[kLightingEnable]&1u) || (regs_[kClearMode]&1u) || (regs_[kTexMapMode]&3u))return false;
     pocket::pmo::Region region;
@@ -224,6 +232,7 @@ Ge::ListResult Ge::run(std::uint32_t pc, std::uint32_t stall, const ListEvent &o
     const bool probe_list = backend_ != nullptr && geometry_probe_.active();
     const auto probe_start = probe_list ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto list_measure=render_probe_.scope(pocket::RenderProbe::Lists,0);
+    pocket::phase::GeScope list_phase(pocket::phase::GeCommands);
     const ListResult result = run_commands(pc, stall, on_event);
     if (backend_ != nullptr) backend_->flush();
     if (probe_list) geometry_probe_.add_list(static_cast<std::uint64_t>(
@@ -303,17 +312,36 @@ Ge::ListResult Ge::run_commands(std::uint32_t pc, std::uint32_t stall, const Lis
 }
 
 void Ge::execute(std::uint32_t word, std::uint32_t) {
+    pocket::phase::GeScope state_phase(pocket::phase::GeState);
     const std::uint32_t cmd = word >> 24u;
     const std::uint32_t data = word & 0x00FFFFFFu;
     // All non-PRIM state commands conservatively end the transform epoch.
     if (cmd != kPrim) ++transform_cache_generation_;
-    if (cmd == kWorldMatrixData || cmd == kViewMatrixData || cmd == kProjMatrixData ||
-        (cmd >= kViewportXScale && cmd <= kViewportZCenter) || cmd == kOffsetX || cmd == kOffsetY)
-        ++rigid_transform_generation_;
-    // PSP texture flush/sync, palette load and GE image copy end validation epochs.
-    // Increment on EVERY command, even if its argument equals the previous value.
-    if (cmd == 0xCB || cmd == 0xCC || cmd == kLoadClut || cmd == kTransferStart)
-        ++texture_cache_generation_;
+    // POCKET_CPU_XFORM_V5: invalidate the lazily rebuilt per-draw constants.
+    // POCKET_CMD_FLAGS_V5B: one table lookup per command instead of a chain of range tests. Same commands as before:
+    //   world/view/proj matrix data -> xform + rigid generation; viewport and screen offset -> viewport + rigid
+    //   generation; lighting/light enables and 0x51..0x9A (normal reverse, material, lights) -> light;
+    //   texture flush/sync, palette load and GE image copy -> texture cache generation (on EVERY such command,
+    //   even if its argument equals the previous value).
+    enum : std::uint8_t { kFXform = 1, kFViewport = 2, kFLight = 4, kFRigid = 8, kFTexture = 16 };
+    static constexpr auto kCmdFlags = [] {
+        std::array<std::uint8_t, 256> t{};
+        for (std::uint32_t c : {kWorldMatrixData, kViewMatrixData, kProjMatrixData}) t[c] |= kFXform | kFRigid;
+        for (std::uint32_t c = kViewportXScale; c <= kViewportZCenter; ++c) t[c] |= kFViewport | kFRigid;
+        t[kOffsetX] |= kFViewport | kFRigid;
+        t[kOffsetY] |= kFViewport | kFRigid;
+        for (std::uint32_t c = kLightingEnable; c <= kLightEnable0 + 3u; ++c) t[c] |= kFLight;
+        for (std::uint32_t c = kReverseNormal; c <= 0x9Au; ++c) t[c] |= kFLight;
+        for (std::uint32_t c : {0xCBu, 0xCCu, std::uint32_t(kLoadClut), std::uint32_t(kTransferStart)}) t[c] |= kFTexture;
+        return t;
+    }();
+    if (const std::uint8_t f = kCmdFlags[cmd]) {
+        if (f & kFXform) xform_dirty_ = true;
+        if (f & kFViewport) viewport_dirty_ = true;
+        if (f & kFLight) light_dirty_ = true;
+        if (f & kFRigid) ++rigid_transform_generation_;
+        if (f & kFTexture) ++texture_cache_generation_;
+    }
     switch (cmd) {
     case kPrim: regs_[cmd] = data; draw_primitive(data); return;
     case kBezier: case kSpline: draw_bezier_or_spline(cmd, data); return;
@@ -326,7 +354,7 @@ void Ge::execute(std::uint32_t word, std::uint32_t) {
     case kProjMatrixData: if (proj_i_ < 16) proj_.m[proj_i_++] = float24(data); ++camera_generation_; return;
     case kTgenMatrixNumber: texgen_i_ = data & 15u; return;
     case kTgenMatrixData: if (texgen_i_ < 12) texgen_.m[texgen_i_++] = float24(data); return;
-    case kBoneMatrixNumber: bone_i_ = data & 0x7Fu; return;
+    case kBoneMatrixNumber: bone_i_ = data & 0x7Fu; geometry_probe_.bone_upload(); return;
     case kBoneMatrixData:
         if (bone_i_ < 96) {
             bones_[bone_i_ / 12].m[bone_i_ % 12] = float24(data);
@@ -342,8 +370,11 @@ void Ge::execute(std::uint32_t word, std::uint32_t) {
         // Matrices/vertices are already transformed in the GE and do not require
         // changing the raster state. Texture cache events have a separate counter.
         if (regs_[cmd] != data) {
+            // POCKET_STATE_KEY_V7: the hardware backend converts every vertex format to one GL layout, so VTYPE only
+            // changes its raster state through the "through" (2D) bit. UV scale/offset (0x48..0x4B) are applied to
+            // the vertices before they reach the backend and are read per draw by the rigid and PMO paths.
+            if (cmd == kVertexType && ((regs_[cmd] ^ data) & (1u << 23u)) != 0) ++render_state_generation_;
             switch (cmd) {
-            case 0x12:
             case 0x1E:
             case 0x1F:
             case 0x21:
@@ -351,10 +382,6 @@ void Ge::execute(std::uint32_t word, std::uint32_t) {
             case 0x23:
             case 0x24:
             case 0x27:
-            case 0x48:
-            case 0x49:
-            case 0x4A:
-            case 0x4B:
             case 0x50:
             case 0x9C:
             case 0x9D:
@@ -439,12 +466,92 @@ Layout layout_for(std::uint32_t vt) {
 
 std::uint32_t Ge::vertex_size() const {
     const std::uint32_t vt = regs_[kVertexType];
-    const unsigned morphs = ((vt >> 18u) & 7u) + 1u;
-    return layout_for(vt).size * morphs;
+    if (plan_.vt != vt) rebuild_plan(vt);
+    return plan_.size * plan_.morphs;
+}
+
+void Ge::rebuild_plan(std::uint32_t vt) const {
+    const unsigned tc = vt & 3u, color = (vt >> 2u) & 7u, normal = (vt >> 5u) & 3u, pos = (vt >> 7u) & 3u;
+    const unsigned weight = (vt >> 9u) & 3u;
+    const Layout l = layout_for(vt);
+    DecodePlan &p = plan_;
+    p.vt = vt;
+    p.through = (vt & (1u << 23u)) != 0;
+    p.morphs = ((vt >> 18u) & 7u) + 1u;
+    p.nweights = std::min(((vt >> 14u) & 7u) + 1u, 8u);
+    p.size = l.size;
+    p.w_fmt = weight; p.w_off = l.weight_offset;
+    p.tc_fmt = tc; p.tc_off = l.tc_offset;
+    p.col_fmt = color; p.col_off = l.color_offset;
+    p.n_fmt = normal; p.n_off = l.normal_offset;
+    p.p_fmt = pos != 0 ? pos : 3u; p.p_off = l.pos_offset;
+    // Same divisions the generic reader performs, as exact power-of-two multiplications.
+    p.w_scale = weight == 1 ? 1.0f / 128.0f : weight == 2 ? 1.0f / 32768.0f : 1.0f;
+    p.tc_scale = p.through ? 1.0f : (tc == 1 ? 1.0f / 128.0f : tc == 2 ? 1.0f / 32768.0f : 1.0f);
+    p.n_scale = normal == 1 ? 1.0f / 128.0f : normal == 2 ? 1.0f / 32768.0f : 1.0f;
+    p.p_scale = p.through ? 1.0f : (p.p_fmt == 1 ? 1.0f / 128.0f : p.p_fmt == 2 ? 1.0f / 32768.0f : 1.0f);
 }
 
 Ge::DecodedVertex Ge::decode_vertex(std::uint32_t address) const {
     const std::uint32_t vt = regs_[kVertexType];
+    if (plan_.vt != vt) rebuild_plan(vt);
+    if (plan_.morphs == 1 && plan_.size <= 160) {
+        const DecodePlan &p = plan_;
+        std::uint8_t tmp[160];
+        const std::uint8_t *s = host(address, p.size);
+        if (s == nullptr) { // partly unmapped: bytes outside guest memory read as 0, like the generic reader
+            for (unsigned i = 0; i < p.size; ++i) tmp[i] = rd8(address + i);
+            s = tmp;
+        }
+        const auto ld16 = [s](unsigned o) { std::uint16_t v; std::memcpy(&v, s + o, 2); return v; };
+        const auto ld32 = [s](unsigned o) { std::uint32_t v; std::memcpy(&v, s + o, 4); return v; };
+        DecodedVertex out{};
+        if (p.w_fmt != 0) {
+            const unsigned step = p.w_fmt == 3 ? 4u : p.w_fmt;
+            for (unsigned i = 0; i < p.nweights; ++i) {
+                const unsigned o = p.w_off + i * step;
+                out.weights[i] = p.w_fmt == 1 ? static_cast<float>(s[o]) * p.w_scale
+                               : p.w_fmt == 2 ? static_cast<float>(ld16(o)) * p.w_scale
+                               : std::bit_cast<float>(ld32(o));
+            }
+        }
+        if (p.tc_fmt != 0) {
+            const unsigned step = p.tc_fmt == 3 ? 4u : p.tc_fmt;
+            for (unsigned i = 0; i < 2; ++i) {
+                const unsigned o = p.tc_off + i * step;
+                out.uv[i] = p.tc_fmt == 1 ? static_cast<float>(s[o]) * p.tc_scale
+                          : p.tc_fmt == 2 ? static_cast<float>(ld16(o)) * p.tc_scale
+                          : std::bit_cast<float>(ld32(o));
+            }
+        }
+        if (p.col_fmt != 0) {
+            if (p.col_fmt == 7) unpack(ld32(p.col_off), out.color);
+            else unpack(decode16(ld16(p.col_off), p.col_fmt - 4u), out.color);
+            out.has_color = true;
+        }
+        if (p.n_fmt != 0) {
+            const unsigned step = p.n_fmt == 3 ? 4u : p.n_fmt;
+            for (unsigned i = 0; i < 3; ++i) {
+                const unsigned o = p.n_off + i * step;
+                out.normal[i] = p.n_fmt == 1 ? static_cast<float>(static_cast<std::int8_t>(s[o])) * p.n_scale
+                              : p.n_fmt == 2 ? static_cast<float>(static_cast<std::int16_t>(ld16(o))) * p.n_scale
+                              : std::bit_cast<float>(ld32(o));
+            }
+            out.has_normal = true;
+        }
+        {
+            const unsigned step = p.p_fmt == 3 ? 4u : p.p_fmt;
+            for (unsigned i = 0; i < 3; ++i) {
+                const unsigned o = p.p_off + i * step;
+                if (p.p_fmt == 1) out.pos[i] = static_cast<float>(static_cast<std::int8_t>(s[o])) * p.p_scale;
+                else if (p.p_fmt == 2)
+                    out.pos[i] = (p.through && i == 2 ? static_cast<float>(ld16(o))
+                                                      : static_cast<float>(static_cast<std::int16_t>(ld16(o)))) * p.p_scale;
+                else out.pos[i] = std::bit_cast<float>(ld32(o));
+            }
+        }
+        return out;
+    }
     const bool through = (vt & (1u << 23u)) != 0;
     const unsigned tc = vt & 3u, color = (vt >> 2u) & 7u, normal = (vt >> 5u) & 3u, pos = (vt >> 7u) & 3u;
     const unsigned weight = (vt >> 9u) & 3u, weights = ((vt >> 14u) & 7u) + 1u;
@@ -531,81 +638,117 @@ Ge::DecodedVertex Ge::decode_vertex(std::uint32_t address) const {
 
 // ---------------------------------------------------------------- transform and lighting
 
-void Ge::light(const float wp[3], const float wn[3], Vertex &out, const DecodedVertex &in) const {
-    float vc[4] = {in.color[0], in.color[1], in.color[2], in.color[3]};
-    const std::uint32_t update = in.has_color ? regs_[kMaterialUpdate] : 0u;
-    float ambient[4], diffuse[4], specular[4], emissive[4], global[4];
-    unpack(regs_[kMaterialAmbient] | (regs_[kMaterialAlpha] << 24u), ambient);
-    unpack(regs_[kMaterialDiffuse], diffuse);
-    unpack(regs_[kMaterialSpecular], specular);
-    unpack(regs_[kMaterialEmissive], emissive);
-    unpack(regs_[kAmbientColor] | (regs_[kAmbientAlpha] << 24u), global);
-    if ((update & 1u) != 0) std::copy(vc, vc + 4, ambient);
-    if ((update & 2u) != 0) std::copy(vc, vc + 4, diffuse);
-    if ((update & 4u) != 0) std::copy(vc, vc + 4, specular);
+namespace {
+constexpr float kInv255 = 1.0f / 255.0f;
+}
 
-    float r = emissive[0] + global[0] * ambient[0] / 255.0f;
-    float g = emissive[1] + global[1] * ambient[1] / 255.0f;
-    float b = emissive[2] + global[2] * ambient[2] / 255.0f;
-    float sr = 0, sg = 0, sb = 0;
-    const float a = global[3] * ambient[3] / 255.0f;
-    float n[3] = {wn[0], wn[1], wn[2]};
-    const float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-    if (nl > 0) for (float &c : n) c /= nl;
-    if ((regs_[kReverseNormal] & 1u) != 0) for (float &c : n) c = -c;
-    const float shininess = float24(regs_[kMaterialSpecularCoef]);
-
+void Ge::rebuild_light() const {
+    auto &c = light_cache_;
+    unpack(regs_[kMaterialAmbient] | (regs_[kMaterialAlpha] << 24u), c.ambient);
+    unpack(regs_[kMaterialDiffuse], c.diffuse);
+    unpack(regs_[kMaterialSpecular], c.specular);
+    unpack(regs_[kMaterialEmissive], c.emissive);
+    unpack(regs_[kAmbientColor] | (regs_[kAmbientAlpha] << 24u), c.global);
+    c.update = regs_[kMaterialUpdate];
+    c.reverse = (regs_[kReverseNormal] & 1u) != 0;
+    c.separate = (regs_[kLightMode] & 1u) != 0;
+    c.shininess = float24(regs_[kMaterialSpecularCoef]);
+    c.base_r = c.emissive[0] + c.global[0] * c.ambient[0] * kInv255;
+    c.base_g = c.emissive[1] + c.global[1] * c.ambient[1] * kInv255;
+    c.base_b = c.emissive[2] + c.global[2] * c.ambient[2] * kInv255;
+    c.base_a = c.global[3] * c.ambient[3] * kInv255;
+    c.count = 0;
     for (unsigned i = 0; i < 4; ++i) {
         if ((regs_[kLightEnable0 + i] & 1u) == 0) continue;
+        auto &l = c.light[c.count++];
         const std::uint32_t type = regs_[kLightType0 + i];
-        const unsigned kind = (type >> 8u) & 3u;    // 0 directional, 1 point, 2 spot
-        const unsigned comp = type & 3u;            // 0 diffuse, 1 diffuse+specular, 2 powered diffuse
-        float lp[3], ld[3], att[3];
-        for (unsigned c = 0; c < 3; ++c) {
-            lp[c] = float24(regs_[kLightPos0 + i * 3 + c]);
-            ld[c] = float24(regs_[kLightDir0 + i * 3 + c]);
-            att[c] = float24(regs_[kLightAtt0 + i * 3 + c]);
+        l.kind = (type >> 8u) & 3u;
+        l.comp = type & 3u;
+        for (unsigned k = 0; k < 3; ++k) {
+            l.pos[k] = float24(regs_[kLightPos0 + i * 3 + k]);
+            l.dir[k] = float24(regs_[kLightDir0 + i * 3 + k]);
+            l.att[k] = float24(regs_[kLightAtt0 + i * 3 + k]);
         }
+        // A directional light's direction does not depend on the vertex: normalize it once.
+        std::copy(l.pos, l.pos + 3, l.unit);
+        const float ll = std::sqrt(l.unit[0] * l.unit[0] + l.unit[1] * l.unit[1] + l.unit[2] * l.unit[2]);
+        if (ll > 0) for (float &v : l.unit) v /= ll;
+        const float dl = std::sqrt(l.dir[0] * l.dir[0] + l.dir[1] * l.dir[1] + l.dir[2] * l.dir[2]);
+        l.inv_dir_length = dl > 0 ? 1.0f / dl : 0.0f;
+        l.cutoff = float24(regs_[kLightSpotCutoff0 + i]);
+        l.spot_exp = float24(regs_[kLightSpotExp0 + i]);
+        unpack(regs_[kLightColor0 + i * 3 + 0], l.lac);
+        unpack(regs_[kLightColor0 + i * 3 + 1], l.ldc);
+        unpack(regs_[kLightColor0 + i * 3 + 2], l.lsc);
+    }
+    light_dirty_ = false;
+}
+
+void Ge::light(const float wp[3], const float wn[3], Vertex &out, const DecodedVertex &in) const {
+    if (light_dirty_) rebuild_light();
+    const LightCache &c = light_cache_;
+    const float *vc = in.color;
+    const std::uint32_t update = in.has_color ? c.update : 0u;
+    const float *ambient = (update & 1u) != 0 ? vc : c.ambient;
+    const float *diffuse = (update & 2u) != 0 ? vc : c.diffuse;
+    const float *specular = (update & 4u) != 0 ? vc : c.specular;
+
+    float r = c.base_r, g = c.base_g, b = c.base_b, a = c.base_a;
+    if ((update & 1u) != 0) {
+        r = c.emissive[0] + c.global[0] * ambient[0] * kInv255;
+        g = c.emissive[1] + c.global[1] * ambient[1] * kInv255;
+        b = c.emissive[2] + c.global[2] * ambient[2] * kInv255;
+        a = c.global[3] * ambient[3] * kInv255;
+    }
+    float sr = 0, sg = 0, sb = 0;
+    float n[3] = {wn[0], wn[1], wn[2]};
+    const float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (nl > 0) {
+        const float inv = 1.0f / nl;
+        n[0] *= inv; n[1] *= inv; n[2] *= inv;
+    }
+    if (c.reverse) { n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2]; }
+    const float shininess = c.shininess;
+
+    for (unsigned i = 0; i < c.count; ++i) {
+        const LightCache::One &l = c.light[i];
         float L[3];
         float attenuation = 1.0f;
-        if (kind == 0) {
-            std::copy(lp, lp + 3, L);
+        if (l.kind == 0) {
+            L[0] = l.unit[0]; L[1] = l.unit[1]; L[2] = l.unit[2];
         } else {
-            for (unsigned c = 0; c < 3; ++c) L[c] = lp[c] - wp[c];
+            L[0] = l.pos[0] - wp[0]; L[1] = l.pos[1] - wp[1]; L[2] = l.pos[2] - wp[2];
             const float d = std::sqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
-            const float denom = att[0] + att[1] * d + att[2] * d * d;
+            const float denom = l.att[0] + l.att[1] * d + l.att[2] * d * d;
             attenuation = denom > 0 ? std::min(1.0f, 1.0f / denom) : 1.0f;
+            if (d > 0) {
+                const float inv = 1.0f / d;
+                L[0] *= inv; L[1] *= inv; L[2] *= inv;
+            }
+            if (l.kind == 2) {
+                float spot = l.inv_dir_length > 0
+                                 ? -(L[0] * l.dir[0] + L[1] * l.dir[1] + L[2] * l.dir[2]) * l.inv_dir_length
+                                 : 0.0f;
+                spot = spot >= l.cutoff ? std::pow(std::max(spot, 0.0f), l.spot_exp) : 0.0f;
+                attenuation *= spot;
+            }
         }
-        const float ll = std::sqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
-        if (ll > 0) for (float &c : L) c /= ll;
-        if (kind == 2) {
-            const float dl = std::sqrt(ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2]);
-            float spot = dl > 0 ? -(L[0] * ld[0] + L[1] * ld[1] + L[2] * ld[2]) / dl : 0.0f;
-            const float cutoff = float24(regs_[kLightSpotCutoff0 + i]);
-            spot = spot >= cutoff ? std::pow(std::max(spot, 0.0f), float24(regs_[kLightSpotExp0 + i])) : 0.0f;
-            attenuation *= spot;
-        }
-        float lac[4], ldc[4], lsc[4];
-        unpack(regs_[kLightColor0 + i * 3 + 0], lac);
-        unpack(regs_[kLightColor0 + i * 3 + 1], ldc);
-        unpack(regs_[kLightColor0 + i * 3 + 2], lsc);
         float dot = std::max(0.0f, n[0] * L[0] + n[1] * L[1] + n[2] * L[2]);
-        if (comp == 2) dot = std::pow(dot, shininess);
-        r += attenuation * (lac[0] * ambient[0] + ldc[0] * diffuse[0] * dot) / 255.0f;
-        g += attenuation * (lac[1] * ambient[1] + ldc[1] * diffuse[1] * dot) / 255.0f;
-        b += attenuation * (lac[2] * ambient[2] + ldc[2] * diffuse[2] * dot) / 255.0f;
-        if (comp == 1 && dot > 0) {
+        if (l.comp == 2) dot = std::pow(dot, shininess);
+        r += attenuation * (l.lac[0] * ambient[0] + l.ldc[0] * diffuse[0] * dot) * kInv255;
+        g += attenuation * (l.lac[1] * ambient[1] + l.ldc[1] * diffuse[1] * dot) * kInv255;
+        b += attenuation * (l.lac[2] * ambient[2] + l.ldc[2] * diffuse[2] * dot) * kInv255;
+        if (l.comp == 1 && dot > 0) {
             float h[3] = {L[0], L[1], L[2] + 1.0f};
             const float hl = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
             const float s = hl > 0 ? std::pow(std::max(0.0f, (n[0] * h[0] + n[1] * h[1] + n[2] * h[2]) / hl), shininess)
                                    : 0.0f;
-            sr += attenuation * lsc[0] * specular[0] * s / 255.0f;
-            sg += attenuation * lsc[1] * specular[1] * s / 255.0f;
-            sb += attenuation * lsc[2] * specular[2] * s / 255.0f;
+            sr += attenuation * l.lsc[0] * specular[0] * s * kInv255;
+            sg += attenuation * l.lsc[1] * specular[1] * s * kInv255;
+            sb += attenuation * l.lsc[2] * specular[2] * s * kInv255;
         }
     }
-    const bool separate = (regs_[kLightMode] & 1u) != 0;
-    if (!separate) {
+    if (!c.separate) {
         r += sr; g += sg; b += sb;
         sr = sg = sb = 0;
     }
@@ -616,6 +759,31 @@ void Ge::light(const float wp[3], const float wn[3], Vertex &out, const DecodedV
     out.sr = std::min(sr, 255.0f);
     out.sg = std::min(sg, 255.0f);
     out.sb = std::min(sb, 255.0f);
+}
+
+// Projection * view * world as one matrix (built in double, rounded once). The three matrices only change when the
+// game uploads them, which is far less often than a vertex is transformed.
+void Ge::rebuild_xform() const {
+    double w4[16] = {}, v4[16] = {}, p[16], t[16], c[16];
+    auto lift = [](const Matrix43 &m, double *o) {
+        for (int col = 0; col < 3; ++col) for (int row = 0; row < 3; ++row) o[col * 4 + row] = m.m[static_cast<std::size_t>(col * 3 + row)];
+        for (int row = 0; row < 3; ++row) o[12 + row] = m.m[static_cast<std::size_t>(9 + row)];
+        o[15] = 1.0;
+    };
+    lift(world_, w4); lift(view_, v4);
+    for (int i = 0; i < 16; ++i) p[i] = proj_.m[static_cast<std::size_t>(i)];
+    auto mul = [](const double *x, const double *y, double *o) {
+        for (int col = 0; col < 4; ++col)
+            for (int row = 0; row < 4; ++row) {
+                double acc = 0;
+                for (int k = 0; k < 4; ++k) acc += x[k * 4 + row] * y[col * 4 + k];
+                o[col * 4 + row] = acc;
+            }
+    };
+    mul(v4, w4, t);   // view * world
+    mul(p, t, c);     // projection * (view * world)
+    for (int i = 0; i < 16; ++i) xform_cache_.clip[i] = static_cast<float>(c[i]);
+    xform_dirty_ = false;
 }
 
 Vertex Ge::transform(const DecodedVertex &in) const {
@@ -639,31 +807,38 @@ Vertex Ge::transform(const DecodedVertex &in) const {
         return out;
     }
     // Skinning. Texture generation below uses the original input normal.
+    if (xform_dirty_) rebuild_xform();
     const bool lighting = (regs_[kLightingEnable] & 1u) != 0;
     float model[3] = {in.pos[0], in.pos[1], in.pos[2]};
     float normal[3] = {in.normal[0], in.normal[1], in.normal[2]};
     if (((vt >> 9u) & 3u) != 0) {
+        // sum(w_i * (B_i * p)) == (sum(w_i * B_i)) * p: blend the bone matrices once, then apply the result to the
+        // position and (when lit) to the normal. This holds for any weights, including ones that do not add up to 1.
         const unsigned count = ((vt >> 14u) & 7u) + 1u;
-        float p[3] = {0, 0, 0}, nn[3] = {0, 0, 0};
-        for (unsigned i = 0; i < count; ++i) {
-            float tp[3], tn[3];
-            mul43(bones_[i], in.pos, tp);
-            if (lighting) mul43(bones_[i], in.normal, tn, 0.0f);
-            for (int c = 0; c < 3; ++c) {
-                p[c] += tp[c] * in.weights[i];
-                if (lighting) nn[c] += tn[c] * in.weights[i];
-            }
+        float bm[12] = {};
+        for (unsigned i = 0; i < count && i < 8; ++i) {
+            const float w = in.weights[i];
+            const float *bone = bones_[i].m.data();
+            for (int k = 0; k < 12; ++k) bm[k] += bone[k] * w;
         }
-        std::copy(p, p + 3, model);
-        std::copy(nn, nn + 3, normal);
+        const float px = in.pos[0], py = in.pos[1], pz = in.pos[2];
+        model[0] = px * bm[0] + py * bm[3] + pz * bm[6] + bm[9];
+        model[1] = px * bm[1] + py * bm[4] + pz * bm[7] + bm[10];
+        model[2] = px * bm[2] + py * bm[5] + pz * bm[8] + bm[11];
+        if (lighting) {
+            const float nx = in.normal[0], ny = in.normal[1], nz = in.normal[2];
+            normal[0] = nx * bm[0] + ny * bm[3] + nz * bm[6];
+            normal[1] = nx * bm[1] + ny * bm[4] + nz * bm[7];
+            normal[2] = nx * bm[2] + ny * bm[5] + nz * bm[8];
+        }
     }
-    float world[3], view[3], wn[3];
+    float world[3], wn[3];
     mul43(world_, model, world);
     if (lighting) mul43(world_, normal, wn, 0.0f);
-    mul43(view_, world, view);
-    const float v4[4] = {view[0], view[1], view[2], 1.0f};
+    const float *cm = xform_cache_.clip;
     float clip[4];
-    mul44(proj_, v4, clip);
+    for (int i = 0; i < 4; ++i)
+        clip[i] = model[0] * cm[i] + model[1] * cm[4 + i] + model[2] * cm[8 + i] + cm[12 + i];
     out.x = clip[0]; out.y = clip[1]; out.z = clip[2]; out.w = clip[3];
     std::copy(world, world + 3, out.world);
     out.has_world = true;
@@ -686,6 +861,7 @@ Vertex Ge::transform(const DecodedVertex &in) const {
 
     // Color.
     if (lighting) {
+        pocket::phase::GeScope light_phase(pocket::phase::GeLight);
         light(world, wn, out, in);
     } else if (in.has_color) {
         out.r = in.color[0]; out.g = in.color[1]; out.b = in.color[2]; out.a = in.color[3];
@@ -696,19 +872,29 @@ Vertex Ge::transform(const DecodedVertex &in) const {
     }
     // Fog factor from view-space depth.
     if ((regs_[kFogEnable] & 1u) != 0) {
-        out.fog = std::clamp((view[2] + float24(regs_[kFog1])) * float24(regs_[kFog2]), 0.0f, 1.0f);
+        const float view_z = world[0] * view_.m[2] + world[1] * view_.m[5] + world[2] * view_.m[8] + view_.m[11];
+        out.fog = std::clamp((view_z + float24(regs_[kFog1])) * float24(regs_[kFog2]), 0.0f, 1.0f);
     }
     return out;
 }
 
+void Ge::rebuild_viewport() const {
+    ViewportCache &v = viewport_cache_;
+    v.xs = float24(regs_[kViewportXScale]); v.ys = float24(regs_[kViewportYScale]); v.zs = float24(regs_[kViewportZScale]);
+    v.xc = float24(regs_[kViewportXCenter]); v.yc = float24(regs_[kViewportYCenter]); v.zc = float24(regs_[kViewportZCenter]);
+    v.ox = static_cast<float>(regs_[kOffsetX] & 0xFFFFu) / 16.0f;
+    v.oy = static_cast<float>(regs_[kOffsetY] & 0xFFFFu) / 16.0f;
+    viewport_dirty_ = false;
+}
+
 Vertex Ge::to_screen(const Vertex &c) const {
+    if (viewport_dirty_) rebuild_viewport();
+    const ViewportCache &vp = viewport_cache_;
     Vertex s = c;
     const float inv_w = c.w != 0 ? 1.0f / c.w : 1.0f;
-    const float offset_x = static_cast<float>(regs_[kOffsetX] & 0xFFFFu) / 16.0f;
-    const float offset_y = static_cast<float>(regs_[kOffsetY] & 0xFFFFu) / 16.0f;
-    s.x = c.x * inv_w * float24(regs_[kViewportXScale]) + float24(regs_[kViewportXCenter]) - offset_x;
-    s.y = c.y * inv_w * float24(regs_[kViewportYScale]) + float24(regs_[kViewportYCenter]) - offset_y;
-    s.z = c.z * inv_w * float24(regs_[kViewportZScale]) + float24(regs_[kViewportZCenter]);
+    s.x = c.x * inv_w * vp.xs + vp.xc - vp.ox;
+    s.y = c.y * inv_w * vp.ys + vp.yc - vp.oy;
+    s.z = c.z * inv_w * vp.zs + vp.zc;
     s.w = inv_w; // keep 1/w for perspective-correct interpolation
     return s;
 }
@@ -738,6 +924,7 @@ Vertex Ge::cached_transform(std::uint32_t address, std::uint32_t size) {
 
 void Ge::draw_primitive(std::uint32_t data) {
     auto draw_measure=render_probe_.scope(pocket::RenderProbe::Draw);
+    pocket::phase::GeScope prim_phase(pocket::phase::GePrimSetup); // restored to the caller's phase on return
     const unsigned type = (data >> 16u) & 7u;
     const unsigned count = data & 0xFFFFu;
     const std::uint32_t vt = regs_[kVertexType];
@@ -751,8 +938,12 @@ void Ge::draw_primitive(std::uint32_t data) {
     // A handled indexed draw must advance the guest index pointer exactly as
     // the reference path does. Unsupported paths have no state side effects.
     // POCKET_U8_GPU_V12: identical 12-byte vertex layout; only index width differs.
-    if (backend_ != nullptr &&
-        backend_->draw_rigid(*this, type, count, vaddr, iaddr)) {
+    bool rigid_handled = false;
+    if (backend_ != nullptr) {
+        pocket::phase::GeScope rigid_phase(pocket::phase::GeRigid);
+        rigid_handled = backend_->draw_rigid(*this, type, count, vaddr, iaddr);
+    }
+    if (rigid_handled) {
         if (index_format) regs_[kIaddr] = iaddr + count * (index_format == 1 ? 1u : 2u);
         else regs_[kVaddr] = vaddr + count * vsize;
         return;
@@ -764,7 +955,10 @@ void Ge::draw_primitive(std::uint32_t data) {
     const std::uint64_t timing_scale = full_timing ? 1u : 30u;
     if (probe_draw) {
         const unsigned flags = (regs_[kLightingEnable]&1u) | ((regs_[kTexMapMode]&3u)<<1) |
-            ((regs_[kTextureMapEnable]&1u)<<3) | ((regs_[kFogEnable]&1u)<<4) | ((regs_[kClearMode]&1u)<<5);
+            ((regs_[kTextureMapEnable]&1u)<<3) | ((regs_[kFogEnable]&1u)<<4) | ((regs_[kClearMode]&1u)<<5) |
+            // POCKET_CENSUS_V6: lights switched on (only meaningful with lighting), bits 6..8.
+            (((regs_[kLightingEnable]&1u) ? (regs_[kLightEnable0]&1u) + (regs_[kLightEnable0+1]&1u) +
+              (regs_[kLightEnable0+2]&1u) + (regs_[kLightEnable0+3]&1u) : 0u) << 6);
         geometry_probe_.record(vt,type,count,vsize,flags);
     }
 #if defined(__vita__)
@@ -796,6 +990,7 @@ void Ge::draw_primitive(std::uint32_t data) {
     }
     const auto t_start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto vertices_measure=render_probe_.scope(pocket::RenderProbe::Vertices);
+    pocket::phase::ge_phase.store(pocket::phase::GeVertices, std::memory_order_relaxed);
     auto &verts = vertex_scratch_;
     verts.clear();
     verts.reserve(count);
@@ -835,6 +1030,7 @@ void Ge::draw_primitive(std::uint32_t data) {
     vertex_decoded_ += count - reused_this_draw;
     vertices_measure.stop();
     auto assembly_measure=render_probe_.scope(pocket::RenderProbe::Assembly);
+    pocket::phase::ge_phase.store(pocket::phase::GeAssembly, std::memory_order_relaxed);
     const auto t_vertices = timed ? std::chrono::steady_clock::now() : t_start;
     // The vertex (or index) pointer advances past what was consumed.
     if (index_format == 0) regs_[kVaddr] = vaddr + count * vsize;
@@ -901,8 +1097,9 @@ void Ge::draw_bezier_or_spline(std::uint32_t cmd, std::uint32_t) {
 void Ge::draw_triangle(const Vertex &a, const Vertex &b, const Vertex &c) {
     if (backend_ != nullptr) backend_->triangle_unclipped(*this, a, b, c);
     const Vertex *const in[3] = {&a, &b, &c};
-    const float offset_x = static_cast<float>(regs_[kOffsetX] & 0xFFFFu) / 16.0f;
-    const float offset_y = static_cast<float>(regs_[kOffsetY] & 0xFFFFu) / 16.0f;
+    if (viewport_dirty_) rebuild_viewport();
+    const float offset_x = viewport_cache_.ox;
+    const float offset_y = viewport_cache_.oy;
     bool any_clipped = false;
     Vertex screen[3]; // each vertex is taken to the screen once: for the guard band test and, unclipped, for drawing
     for (int i = 0; i < 3; ++i) {
@@ -1233,6 +1430,7 @@ void Ge::write_pixel(int x, int y, std::uint32_t abgr, std::uint32_t write_mask)
 }
 
 void Ge::block_transfer(std::uint32_t data) {
+    pocket::phase::GeScope transfer_phase(pocket::phase::GeTransfer);
     ++stats_.transfers;
     const std::uint32_t bpp = (data & 1u) != 0 ? 4u : 2u;
     const std::uint32_t src = (regs_[kTransferSrc] & 0xFFFFF0u) | ((regs_[kTransferSrcW] & 0xFF0000u) << 8u);

@@ -3,6 +3,7 @@
 #include "hle.hpp"
 #include "interpreter.hpp"
 #include "kernel.hpp"
+#include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
 
 #include "psprecomp/common.hpp"
 #include "psprecomp/elf32.hpp"
@@ -346,6 +347,8 @@ void call_import(Runtime &rt, Context &ctx, ImportEntry &import) {
                      ctx.gpr[6], ctx.gpr[7]);
     }
     rt.note_import(import.hle->name);
+    pocket::phase::GameScope hle_phase(pocket::phase::GameHle);
+    pocket::phase::game_hle_name.store(import.hle->name, std::memory_order_relaxed); // POCKET_GAME_HOTSPOTS_V11
     import.hle->handler(rt, ctx);
 }
 

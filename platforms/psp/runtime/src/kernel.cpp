@@ -1,5 +1,6 @@
 #include "kernel.hpp"
 #include "hle.hpp"
+#include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
 
 #include "psprecomp/common.hpp"
 
@@ -615,12 +616,21 @@ int Kernel::run_scheduler() {
             const std::uint64_t sleep = earliest == kNoDeadline ? kMaxHostSleepUs
                                                                 : std::min(earliest > now ? earliest - now : 0,
                                                                            kMaxHostSleepUs);
-            if (sleep > 0) precise_sleep(sleep);
+            if (sleep > 0) {
+                pocket::phase::GameScope idle_phase(pocket::phase::game_waiting_ge.load(std::memory_order_relaxed) > 0
+                                                        ? pocket::phase::GameWaitGe : pocket::phase::GameIdle);
+                precise_sleep(sleep);
+            }
             continue;
         }
+        // POCKET_GAME_PHASES_V10: a fiber resumes in game code; phases it entered before it blocked are restored by
+        // its own scopes when they unwind.
+        pocket::phase::game_phase.store(pocket::phase::GameRun, std::memory_order_relaxed);
         current_ = next;
         next->state = ThreadState::Running;
+        pocket::phase::game_ra.store(&next->ctx.gpr[31], std::memory_order_relaxed); // POCKET_GAME_HOTSPOTS_V11
         Fiber::switch_to(*scheduler_fiber_, *next->fiber);
+        pocket::phase::game_ra.store(nullptr, std::memory_order_relaxed);
         current_ = nullptr;
         destroy_finished_fibers();
     }

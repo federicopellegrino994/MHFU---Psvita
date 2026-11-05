@@ -6,6 +6,7 @@
 #include "rigid_gpu_math.hpp"
 #include "rigid_visibility_cache.hpp"
 #include "pocket_pixel.hpp"
+#include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
 #include <vitaGL.h>
 #include <psp2/kernel/processmgr.h>
 #include <algorithm>
@@ -136,6 +137,11 @@ class VitaGpu final : public gpu::Backend {
         };
         StateKey key;
         for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); ++i) key.regs[i] = ge.reg(regs[i]);
+        // POCKET_STATE_KEY_V7: vertices arrive already converted to the single GVertex layout. Of VTYPE only the
+        // through (2D) bit changes GL state; UV scale/offset are already applied to the vertices. Keying on them
+        // flushed the batch and rebuilt every GL state whenever two meshes differed only in bone count.
+        key.regs[0] = ge.reg(0x12) & (1u << 23);
+        key.regs[8] = key.regs[9] = key.regs[10] = key.regs[11] = 0;
         if (!(ge.reg(0xd3) & 1) && (ge.reg(0x1e) & 1)) {
             const auto info = ge.texture_info();
             const auto rt = targets.find(offset(info.address));
@@ -239,6 +245,7 @@ class VitaGpu final : public gpu::Backend {
         }
         Texture t; t.width = info.width; t.height = info.height; t.stamp = serial;
         pixels.resize(std::size_t(info.width) * info.height);
+        pocket::phase::GeScope upload_phase(pocket::phase::GeTexUpload);
         { auto decode_measure=ge.render_probe().scope(pocket::RenderProbe::Decode,0); ge.decode_texture(pixels.data()); }
         {
             auto upload_measure=ge.render_probe().scope(pocket::RenderProbe::Upload,0);
@@ -310,6 +317,7 @@ class VitaGpu final : public gpu::Backend {
             return;
         }
         Cost setup_cost(profile.setup, (serial & 63) == 0, 64);
+        pocket::phase::GeScope prepare_phase(pocket::phase::GePrepare);
         const StateKey next = state_key(ge);
         if (state_valid && next == last_state) {
             last_render_generation = render_generation;
@@ -396,10 +404,10 @@ class VitaGpu final : public gpu::Backend {
         out.position[1] = (1 - p.y * (2.0f / Side)) * w;
         out.position[2] = (std::clamp(p.z, 0.0f, 65535.0f) * (2.0f / 65535) - 1) * w;
         out.position[3] = w;
-        out.color[0] = std::clamp(color.r + (clearing ? 0 : color.sr), 0.0f, 255.0f) / 255;
-        out.color[1] = std::clamp(color.g + (clearing ? 0 : color.sg), 0.0f, 255.0f) / 255;
-        out.color[2] = std::clamp(color.b + (clearing ? 0 : color.sb), 0.0f, 255.0f) / 255;
-        out.color[3] = std::clamp(color.a, 0.0f, 255.0f) / 255;
+        out.color[0] = std::clamp(color.r + (clearing ? 0 : color.sr), 0.0f, 255.0f) * (1.0f / 255.0f);
+        out.color[1] = std::clamp(color.g + (clearing ? 0 : color.sg), 0.0f, 255.0f) * (1.0f / 255.0f);
+        out.color[2] = std::clamp(color.b + (clearing ? 0 : color.sb), 0.0f, 255.0f) * (1.0f / 255.0f);
+        out.color[3] = std::clamp(color.a, 0.0f, 255.0f) * (1.0f / 255.0f);
         out.uv[0] = through ? p.u / texture_width : p.u;
         out.uv[1] = through ? p.v / texture_height : p.v;
         // GE transform() already applies PSP texture scale/offset in 3D.
@@ -421,6 +429,7 @@ class VitaGpu final : public gpu::Backend {
     }
     void draw_batch() {
         if (batch.empty()) return;
+        pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
         Cost submit_cost(profile.submit, (profile.draws & 63) == 0, 64);
         ++profile.draws;
         profile.triangles += static_cast<unsigned>(batch.size() / 3);
@@ -460,6 +469,7 @@ public:
         // NOT an initialization success flag (vgl.c, return res_fallback).
         const GLboolean reduced = vglInitExtended(1024 * 1024, 960, 544, 8 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
         std::fprintf(stderr, "[gpu] vitaGL initialized; resolution fallback=%u\n", unsigned(reduced));
+        std::fprintf(stderr, "[gpu-state] v7 enabled; GL state key ignores bone count/vertex format (except 2D bit) and UV scale\n");
         if (FILE *f = std::fopen("ux0:data/pocketprobe/strict-textures.flag", "rb")) {
             std::fclose(f); strict_validation = true;
         }
@@ -664,6 +674,7 @@ public:
     }
     void draw_started(const gpu::DrawInfo &) override { prepared = false; ++serial; }
     void triangle(const Ge &ge, const Vertex &a, const Vertex &b, const Vertex &c) override {
+        pocket::phase::GeScope tri_phase(pocket::phase::GeBackendTri);
         if (!prepared) prepare(ge);
         if (batch_model) begin_batch(false);
         batch.push_back(vertex(ge, a, flat ? c : a));
@@ -671,6 +682,7 @@ public:
         if (batch.size() >= 12288) draw_batch();
     }
     void sprite(const Ge &ge, const Vertex &a, const Vertex &b) override {
+        pocket::phase::GeScope tri_phase(pocket::phase::GeBackendTri);
         Vertex tl = b, tr = b, bl = b;
         tl.x = a.x; tl.y = a.y; tl.u = a.u; tl.v = a.v;
         tr.y = a.y; tr.v = a.v; bl.x = a.x; bl.u = a.u;
@@ -678,7 +690,7 @@ public:
         Vertex br = b; br.w = 1;
         triangle(ge, tl, tr, bl); triangle(ge, tr, br, bl);
     }
-    void flush() override { draw_batch(); { Cost cost(profile.flush); glFlush(); } prepared = false; state_valid = false; clear_validations(); }
+    void flush() override { pocket::phase::GeScope flush_phase(pocket::phase::GeFlush); draw_batch(); { Cost cost(profile.flush); glFlush(); } prepared = false; state_valid = false; clear_validations(); }
     void block_transfer(unsigned, unsigned, unsigned, unsigned, unsigned dst, unsigned, unsigned, unsigned,
                         unsigned, unsigned, unsigned) override {
         draw_batch(); prepared = false; state_valid = false; clear_validations();
@@ -689,6 +701,7 @@ public:
         if (i != targets.end()) erase_target(i);
     }
     void present(unsigned address, unsigned stride, unsigned format) override {
+        pocket::phase::GeScope present_phase(pocket::phase::GePresent);
         draw_batch(); prepared = false; state_valid = false; clear_validations();
         glBindFramebuffer(GL_FRAMEBUFFER, 0); glViewport(0, 0, 960, 544); plain_state();
         auto i = targets.find(offset(address));
