@@ -308,7 +308,10 @@ void main(
   // POCKET_GPU_SKIN_V13L: one program for everything. uMode.x = 1: an already transformed GVertex batch
   // (aPos clip or model space times uMvp, aColor, aUV as is); 0: a skinned and lit PSP model.
   if (uMode.x > 0.5) {
-    vPosition = uMvp[0] * aPos.x + uMvp[1] * aPos.y + uMvp[2] * aPos.z + uMvp[3] * aPos.w;
+    float4 q = uMvp[0] * aPos.x + uMvp[1] * aPos.y + uMvp[2] * aPos.z + uMvp[3] * aPos.w;
+    // POCKET_GPU_BATCH_V14: depth clamped like the PSP; CPU-path vertices are already inside, so unchanged.
+    q.z = min(max(q.z, -q.w), q.w);
+    vPosition = q;
     vColor = aColor;
     vTexcoord = aUV;
   } else {

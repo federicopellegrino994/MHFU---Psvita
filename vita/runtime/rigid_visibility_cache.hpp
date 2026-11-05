@@ -34,7 +34,8 @@ public:
         if(have_transform_ &&
            std::memcmp(transform_.clip.data(),t.clip.data(),sizeof(t.clip))==0 &&
            std::memcmp(transform_.bound.data(),t.bound.data(),sizeof(t.bound))==0 &&
-           std::memcmp(transform_.viewport.data(),t.viewport.data(),sizeof(t.viewport))==0)
+           std::memcmp(transform_.viewport.data(),t.viewport.data(),sizeof(t.viewport))==0 &&
+           transform_.depth_check==t.depth_check) // POCKET_GPU_BATCH_V14
             return false;
         transform_=t;have_transform_=true;
         if(++epoch_==0){entries_={};epoch_=1;}

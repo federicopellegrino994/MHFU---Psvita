@@ -25,6 +25,9 @@ inline Matrix absolute(Matrix a){for(auto &x:a)x=std::fabs(x);return a;}
 struct Transform {
     Matrix clip{},bound{},gpu{};
     std::array<float,8> viewport{};
+    // POCKET_GPU_BATCH_V14: false once the GPU shader clamps depth like the PSP (custom-shader mode); then depth
+    // outside 0..65535 no longer sends a whole draw/group to the CPU path. Kept across build().
+    bool depth_check=true;
     bool build(const Parameters&p){
         for(float x:p.world)if(!std::isfinite(x))return false;
         for(float x:p.view)if(!std::isfinite(x))return false;
@@ -52,7 +55,8 @@ struct Transform {
     // existing PSP GE triangle pipeline, not merely outside the Vita display.
     enum class Visibility { Safe, OutsideNear, OutsideGuard, Boundary };
     // POCKET_GPU_SKIN_V13D: depth=false for the skin path, whose shader clamps depth exactly as the CPU path does.
-    Visibility classify(float x,float y,float z,bool depth=true)const{
+    Visibility classify(float x,float y,float z)const{return classify(x,y,z,depth_check);}
+    Visibility classify(float x,float y,float z,bool depth)const{
         constexpr float eps=128.0f*std::numeric_limits<float>::epsilon();
         const float p[4]={x,y,z,1};float c[4]{},e[4]{};
         for(unsigned i=0;i<4;++i){

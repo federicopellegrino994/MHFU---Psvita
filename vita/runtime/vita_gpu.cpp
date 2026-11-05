@@ -311,7 +311,12 @@ class VitaGpu final : public gpu::Backend {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &white);
         plain_program = skin_program;
         state_valid = false; prepared = false; // rebind the real texture state at the next draw
-        std::fprintf(stderr, "[gpu-plain] v13m ready: one custom program for every draw (no program switches)\n");
+        // POCKET_GPU_BATCH_V14: the shader clamps depth, so PMO groups and rigid draws whose depth leaves 0..65535
+        // (most of the quest terrain) can stay on the GPU. Rebuild the transform so the cache sees the change.
+        if (FILE *nf = std::fopen("ux0:data/pocketprobe/no-depth-free.flag", "rb")) std::fclose(nf);
+        else { rigid_transform.depth_check = false; rigid_transform_valid = false; }
+        std::fprintf(stderr, "[gpu-batch] v14 depth range check %s\n", rigid_transform.depth_check ? "kept (no-depth-free.flag)" : "off: shader clamps depth like the PSP");
+        std::fprintf(stderr, "[gpu-plain] v14 ready: one custom program for every draw (no program switches)\n");
         std::fflush(stderr);
         return true;
     }
@@ -370,7 +375,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(0); bound_program = 0;
         // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
         if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
-        std::fprintf(stderr, "[gpu-skin] v13m program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v14 program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
