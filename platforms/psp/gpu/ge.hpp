@@ -69,6 +69,13 @@ public:
     void set_backend(Backend *backend) noexcept { backend_ = backend; }
     void geometry_probe_present() {
         geometry_probe_.present();
+        if (std::chrono::steady_clock::now() - transform_cache_report_ >= std::chrono::seconds(5)) {
+            transform_cache_report_ = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[cpu-transform-cache] hits=%llu misses=%llu\n",
+                static_cast<unsigned long long>(transform_cache_hits_),
+                static_cast<unsigned long long>(transform_cache_misses_));
+            transform_cache_hits_ = transform_cache_misses_ = 0;
+        }
         render_probe_.present(stats_.commands,stats_.primitives);
         const auto now=std::chrono::steady_clock::now();
         if(now-pmo_report_time_>=std::chrono::seconds(5) && pocket::pmo::producer_calls.load()) {
@@ -118,6 +125,18 @@ private:
     void draw_primitive(std::uint32_t data);
     bool native_group(std::uint32_t target,std::uint32_t stall);
     pocket::pmo::GroupCache pmo_groups_;
+    struct TransformCacheEntry {
+        std::uint64_t generation = ~std::uint64_t(0);
+        std::uint32_t address{};
+        std::array<std::uint8_t, 64> bytes{};
+        Vertex vertex;
+    };
+    std::array<TransformCacheEntry, 256> transform_cache_{};
+    std::uint64_t transform_cache_generation_{};
+    bool transform_cache_enabled_ = true;
+    std::uint64_t transform_cache_hits_{}, transform_cache_misses_{};
+    std::chrono::steady_clock::time_point transform_cache_report_ = std::chrono::steady_clock::now();
+    Vertex cached_transform(std::uint32_t address, std::uint32_t size);
     std::vector<Vertex> pmo_vertex_scratch_;
     std::vector<Vertex> pmo_screen_scratch_;
     std::vector<unsigned char> pmo_clip_scratch_;

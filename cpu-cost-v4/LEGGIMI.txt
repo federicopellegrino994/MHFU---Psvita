@@ -1,0 +1,18 @@
+CPU cost v4. Richiede GPU formats v3.
+Riuso dei vertici trasformati fra PRIM consecutivi con confronto esatto dei byte sorgente.
+Cache fissa di 256 voci, vertici fino a 64 byte. Ogni comando di stato termina conservativamente l'epoca.
+Riduce le chiamate di profilazione su primitive respinte e triangoli con stato gia preparato.
+Nel log cpu-transform-cache indica hit/miss.
+gpu-reject usa una maschera: 01=2D, 02=illuminazione, 04=pesi, 08=morph,
+10=tipo primitiva, 20=clear, 40=generazione UV, 80=layout o conteggio escluso.
+I bit possono comparire insieme.
+
+Da ~/mhfu-vita:
+python3 cpu-cost-v4/apply.py
+cmake --build build/full-runtime-vita --target pocket-game-boot.vpk-vpk -j2
+Reinstallare il VPK sulla Vita.
+Ripristino: python3 cpu-cost-v4/apply.py --restore
+Ricompilare e reinstallare.
+Per disabilitare solo il riuso CPU creare ux0:data/pocketprobe/no-cpu-transform-cache.flag e riavviare il gioco.
+
+Test host su modelli e formati eseguiti. Compilazione ARM e beneficio FPS da verificare sulla console.

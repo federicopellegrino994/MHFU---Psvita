@@ -72,6 +72,7 @@ class VitaGpu final : public gpu::Backend {
     unsigned pmo_gpu_groups=0,pmo_gpu_boundary=0,pmo_gpu_culled=0;
     struct U8Profile {unsigned attempts{}, draws{}, culled{};} u8_profile;
     struct RigidProfile { unsigned attempts{}, draws{}, vertices{}, state{}, memory{}, clip{}, matrix_splits{}, batches{}, culled_draws{}, culled_vertices{}, outside_near{}, outside_guard{}, boundary{}; } rigid_profile;
+    std::array<unsigned, 256> rejected_states{};
     std::vector<std::uint32_t> pixels;
     std::size_t texture_bytes = 0;
     std::uint64_t serial = 0;
@@ -291,8 +292,8 @@ class VitaGpu final : public gpu::Backend {
         glTexEnvi(GL_TEXTURE_ENV, GL_ALPHA_SCALE, 1);
     }
     void prepare(const Ge &ge) {
-        auto state_measure=ge.render_probe().scope(pocket::RenderProbe::Prepare);
         if (prepared) return;
+        auto state_measure=ge.render_probe().scope(pocket::RenderProbe::Prepare);
         const auto render_generation = ge.render_state_generation();
         const auto texture_generation = ge.texture_cache_generation();
         // POCKET_STATE_FAST_V5: same immutable GE draw state and texture epoch.
@@ -548,7 +549,6 @@ public:
         ++pmo_gpu_groups;return true;
     }
     bool draw_rigid(const Ge &ge, unsigned type, unsigned count, unsigned vaddr, unsigned iaddr) override {
-        auto rigid_measure=ge.render_probe().scope(pocket::RenderProbe::Rigid);
         if (!rigid_enabled) return false;
         ++rigid_profile.attempts;
         const auto vt=ge.reg(0x12);
@@ -561,8 +561,19 @@ public:
             (color_format == 0 || color_format >= 4);
         if (!simple_layout || (u8 && !u8_enabled) || type < 3 || type > 5 || count < 3 || count > 4096 ||
             (ge.reg(0x17)&1) || (ge.reg(0xd3)&1) || (ge.reg(0xc0)&3)) {
+            const unsigned reasons =
+                ((vt & (1u<<23u)) ? 1u : 0u) |
+                ((ge.reg(0x17)&1u) ? 2u : 0u) |
+                ((vt & (3u<<9u)) ? 4u : 0u) |
+                ((vt & (7u<<18u)) ? 8u : 0u) |
+                ((type < 3 || type > 5) ? 16u : 0u) |
+                ((ge.reg(0xd3)&1u) ? 32u : 0u) |
+                ((ge.reg(0xc0)&3u) ? 64u : 0u) |
+                ((!simple_layout || count < 3 || count > 4096 || (u8 && !u8_enabled)) ? 128u : 0u);
+            ++rejected_states[reasons];
             ++rigid_profile.state; return false;
         }
+        auto rigid_measure=ge.render_probe().scope(pocket::RenderProbe::Rigid);
         const auto generation = ge.rigid_transform_generation();
         if (!rigid_transform_valid || generation != rigid_generation) {
             auto matrix_measure=ge.render_probe().scope(pocket::RenderProbe::MatrixBuild,8);
@@ -653,8 +664,8 @@ public:
     }
     void draw_started(const gpu::DrawInfo &) override { prepared = false; ++serial; }
     void triangle(const Ge &ge, const Vertex &a, const Vertex &b, const Vertex &c) override {
-        prepare(ge);
-        begin_batch(false);
+        if (!prepared) prepare(ge);
+        if (batch_model) begin_batch(false);
         batch.push_back(vertex(ge, a, flat ? c : a));
         batch.push_back(vertex(ge, b, flat ? c : b)); batch.push_back(vertex(ge, c, c));
         if (batch.size() >= 12288) draw_batch();
@@ -726,6 +737,10 @@ public:
             std::fprintf(stderr,"[pmo-native-gpu] period: groups=%u culled=%u boundary_to_cpu=%u\n",pmo_gpu_groups,pmo_gpu_culled,pmo_gpu_boundary);
             pmo_gpu_groups=pmo_gpu_culled=pmo_gpu_boundary=0;
             u8_profile={};
+            for (unsigned mask = 0; mask < rejected_states.size(); ++mask)
+                if (rejected_states[mask])
+                    std::fprintf(stderr, "[gpu-reject] mask=%02X count=%u\n", mask, rejected_states[mask]);
+            rejected_states.fill(0);
             rigid_profile={};
             profile = {};
             last_perf = now; last_frames = frames;

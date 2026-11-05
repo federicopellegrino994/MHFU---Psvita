@@ -1,0 +1,14 @@
+{
+  "platforms/psp/gpu/ge.cpp": {
+    "before": "bc8d9af2dab51b19966c958a14ead82efbeded9fef2fc46d46d8b6eedefddbef",
+    "after": "9b257eb495fe8f0272bd2ca32bc1faf2b7649a58eba2331dd7842bea1443e9ad"
+  },
+  "platforms/psp/gpu/ge.hpp": {
+    "before": "e418bf7671caddbb0ce9901dce5829f842401e7c861f9c4ba0ff754174fd7f35",
+    "after": "4b1a273a138ddaabb4fc8e5da9d6ebc15752b5ca4bc9d5f7ac5d1bff223ef380"
+  },
+  "vita/runtime/vita_gpu.cpp": {
+    "before": "c58ab93b412f8dd3007df711e05167a2555d61410c7ec170d2db977a476700fe",
+    "after": "f88309b265f252cab9d7e1e1e800c641a930d0aba69d3ef4b7d795829b955396"
+  }
+}

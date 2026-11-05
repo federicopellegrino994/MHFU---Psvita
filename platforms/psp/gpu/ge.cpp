@@ -128,6 +128,14 @@ Vertex lerp(const Vertex &a, const Vertex &b, float t) {
 float float24(std::uint32_t data) { return std::bit_cast<float>(data << 8u); }
 
 Ge::Ge(psprecomp::GuestMemory &memory) {
+#if defined(__vita__)
+    if (FILE *flag = std::fopen("ux0:data/pocketprobe/no-cpu-transform-cache.flag", "rb")) {
+        std::fclose(flag);
+        transform_cache_enabled_ = false;
+    }
+    std::fprintf(stderr, "[cpu-transform-cache] v4 %s; 256 entries, exact source bytes\n",
+                 transform_cache_enabled_ ? "enabled" : "disabled");
+#endif
     ram_size_ = memory.size();
     ram_ = memory.raw_pointer(psprecomp::GuestMemory::kPhysicalBase, ram_size_);
     vram_ = memory.raw_pointer(psprecomp::GuestMemory::kVramPhysicalBase, psprecomp::GuestMemory::kVramSize);
@@ -152,6 +160,7 @@ bool Ge::native_group(std::uint32_t target,std::uint32_t stall) {
         pmo_clip_scratch_.resize(p->vertices.size());
     }
     catch(const std::bad_alloc&){pmo_groups_.entries.clear();pmo_groups_.used=0;pmo_groups_.allocation_blocked=true;std::vector<Vertex>().swap(pmo_vertex_scratch_);return false;}
+    ++transform_cache_generation_;
     // Only after the entire source was accepted may GE state change.
     base_=0;regs_[kBase]=0;regs_[kVaddr]=p->guest_vertices;regs_[kIaddr]=p->initial_indices;
     execute((kVertexType<<24)|p->vertex_type,0);execute((kCull<<24)|p->cull,0);
@@ -246,6 +255,8 @@ Ge::ListResult Ge::run_commands(std::uint32_t pc, std::uint32_t stall, const Lis
         const std::uint32_t word = rd32(pc);
         const std::uint32_t cmd = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
+    // All non-PRIM state commands conservatively end the transform epoch.
+    if (cmd != kPrim) ++transform_cache_generation_;
         const std::uint32_t here = pc;
         pc += 4u;
         ++stats_.commands;
@@ -294,6 +305,8 @@ Ge::ListResult Ge::run_commands(std::uint32_t pc, std::uint32_t stall, const Lis
 void Ge::execute(std::uint32_t word, std::uint32_t) {
     const std::uint32_t cmd = word >> 24u;
     const std::uint32_t data = word & 0x00FFFFFFu;
+    // All non-PRIM state commands conservatively end the transform epoch.
+    if (cmd != kPrim) ++transform_cache_generation_;
     if (cmd == kWorldMatrixData || cmd == kViewMatrixData || cmd == kProjMatrixData ||
         (cmd >= kViewportXScale && cmd <= kViewportZCenter) || cmd == kOffsetX || cmd == kOffsetY)
         ++rigid_transform_generation_;
@@ -702,6 +715,27 @@ Vertex Ge::to_screen(const Vertex &c) const {
 
 // ---------------------------------------------------------------- primitives
 
+Vertex Ge::cached_transform(std::uint32_t address, std::uint32_t size) {
+    const auto *bytes = transform_cache_enabled_ && size <= 64 ? host(address, size) : nullptr;
+    if (!bytes) {
+        ++transform_cache_misses_;
+        return transform(decode_vertex(address));
+    }
+    auto &entry = transform_cache_[(address >> 2u) & 255u];
+    if (entry.generation == transform_cache_generation_ && entry.address == address &&
+        std::memcmp(entry.bytes.data(), bytes, size) == 0) {
+        ++transform_cache_hits_;
+        return entry.vertex;
+    }
+    ++transform_cache_misses_;
+    auto vertex = transform(decode_vertex(address));
+    entry.generation = transform_cache_generation_;
+    entry.address = address;
+    std::memcpy(entry.bytes.data(), bytes, size);
+    entry.vertex = vertex;
+    return vertex;
+}
+
 void Ge::draw_primitive(std::uint32_t data) {
     auto draw_measure=render_probe_.scope(pocket::RenderProbe::Draw);
     const unsigned type = (data >> 16u) & 7u;
@@ -786,13 +820,13 @@ void Ge::draw_primitive(std::uint32_t data) {
                 ++reused_this_draw;
                 continue;
             }
-            entry.vertex = transform(decode_vertex(address));
+            entry.vertex = cached_transform(address, vsize);
             entry.vertex.source = address;
             entry.index = index;
             entry.epoch = vertex_reuse_epoch_;
             verts.push_back(entry.vertex);
         } else {
-            verts.push_back(transform(decode_vertex(address)));
+            verts.push_back(cached_transform(address, vsize));
             verts.back().source = address;
         }
         // Counters are accumulated once below, outside the hot vertex loop.
