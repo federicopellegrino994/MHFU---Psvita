@@ -199,6 +199,7 @@ class VitaGpu final : public gpu::Backend {
         if (!ok) {
             char log[1024] = {}; GLsizei n = 0; glGetShaderInfoLog(s, sizeof log - 1, &n, log);
             std::fprintf(stderr, "[gpu-skin] %s shader compile FAILED: %s\n", what, log);
+            std::fflush(stderr);
             glDeleteShader(s); return 0;
         }
         return s;
@@ -206,9 +207,16 @@ class VitaGpu final : public gpu::Backend {
     bool skin_setup() {
         if (skin_tried) return skin_ready;
         skin_tried = true;
-        const GLuint vs = skin_shader(GL_VERTEX_SHADER, pocket::skin::kVertexShader, "vertex");
-        const GLuint fs = skin_shader(GL_FRAGMENT_SHADER, pocket::skin::kFragmentShader, "fragment");
-        if (!vs || !fs) { std::fprintf(stderr, "[gpu-skin] disabled: CPU path keeps drawing these models\n"); return false; }
+        // POCKET_GPU_SKIN_V13B: vitaGL treats GL_VERTEX_SHADER/GL_FRAGMENT_SHADER sources as GLSL (compiled only at
+        // link time, with GL_COMPILE_STATUS reporting success meanwhile); Cg needs the _EXT types. With them the
+        // compile happens here and a failure is reported before glLinkProgram can touch a missing program.
+#ifndef GL_CG_VERTEX_SHADER_EXT
+#define GL_CG_VERTEX_SHADER_EXT 0x890E
+#define GL_CG_FRAGMENT_SHADER_EXT 0x890F
+#endif
+        const GLuint vs = skin_shader(GL_CG_VERTEX_SHADER_EXT, pocket::skin::kVertexShader, "vertex");
+        const GLuint fs = skin_shader(GL_CG_FRAGMENT_SHADER_EXT, pocket::skin::kFragmentShader, "fragment");
+        if (!vs || !fs) { std::fprintf(stderr, "[gpu-skin] disabled: CPU path keeps drawing these models\n"); std::fflush(stderr); return false; }
         skin_program = glCreateProgram();
         glAttachShader(skin_program, vs); glAttachShader(skin_program, fs);
         glBindAttribLocation(skin_program, 0, "aW0"); glBindAttribLocation(skin_program, 1, "aW1");
@@ -218,7 +226,7 @@ class VitaGpu final : public gpu::Backend {
         GLint ok = 0; glGetProgramiv(skin_program, GL_LINK_STATUS, &ok);
         if (!ok) {
             char log[1024] = {}; GLsizei n = 0; glGetProgramInfoLog(skin_program, sizeof log - 1, &n, log);
-            std::fprintf(stderr, "[gpu-skin] link FAILED: %s; disabled\n", log); return false;
+            std::fprintf(stderr, "[gpu-skin] link FAILED: %s; disabled\n", log); std::fflush(stderr); return false;
         }
         auto loc = [&](const char *name) {
             GLint l = glGetUniformLocation(skin_program, name);
@@ -231,11 +239,11 @@ class VitaGpu final : public gpu::Backend {
         u_lamb = loc("uLamb"); u_ldif = loc("uLdif"); u_lspe = loc("uLspe");
         u_mamb = loc("uMamb"); u_mdif = loc("uMdif"); u_mspe = loc("uMspe"); u_base = loc("uBase"); u_params = loc("uParams");
         u_tex = loc("uTex"); u_env = loc("uEnv"); u_alpha = loc("uAlpha"); u_sampler = loc("uTexture");
-        if (u_bones < 0 || u_mvp < 0 || u_params < 0 || u_tex < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); return false; }
+        if (u_bones < 0 || u_mvp < 0 || u_params < 0 || u_tex < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); std::fflush(stderr); return false; }
         glUseProgram(skin_program);
         if (u_sampler >= 0) glUniform1i(u_sampler, 0);
         glUseProgram(0);
-        std::fprintf(stderr, "[gpu-skin] v13 program ready (vertex + fragment compiled and linked)\n");
+        std::fprintf(stderr, "[gpu-skin] v13b program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
