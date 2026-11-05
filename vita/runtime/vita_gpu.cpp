@@ -192,17 +192,17 @@ class VitaGpu final : public gpu::Backend {
     // squares in the top-left corner as the variant number + 1, so a video shows which variant fixes the village.
     bool skin_debug = false; int skin_debug_last = -1;
     std::chrono::steady_clock::time_point skin_debug_start{};
-    std::vector<pocket::skin::Vertex> skin_linear;
-    std::vector<std::uint16_t> skin_list;
     int skin_debug_mode() {
         if (!skin_debug) return -1;
         const auto now = std::chrono::steady_clock::now();
         if (skin_debug_last < 0 && skin_debug_start == std::chrono::steady_clock::time_point{}) skin_debug_start = now;
-        const int mode = int(std::chrono::duration<float>(now - skin_debug_start).count() / 8.0f) % 8;
+        // POCKET_GPU_SKIN_V13H: 5 variants x 10 s.
+        const int mode = int(std::chrono::duration<float>(now - skin_debug_start).count() / 10.0f) % 5;
         if (mode != skin_debug_last) {
-            static const char *names[8] = {"0 GPU skin OFF (CPU path, reference)", "1 GPU skin normal", "2 GPU skin, no face culling",
-                "3 GPU skin, no alpha test", "4 GPU skin, no texture (vertex colour only)", "5 GPU skin, no depth test",
-                "6 GPU skin, indices expanded on the CPU (glDrawArrays)", "7 GPU skin, strips/fans turned into triangle lists"};
+            static const char *names[5] = {"0 GPU skin OFF (CPU path, reference)", "1 GPU skin normal",
+                "2 GPU skin computed but NOT drawn (shows which geometry it owns)",
+                "3 GPU skin + full fixed-function state reset after every skinned draw",
+                "4 GPU skin, every uniform uploaded on every draw (no caching)"};
             std::fprintf(stderr, "[skin-debug] variant %s (%d white squares)\n", names[mode], mode + 1); std::fflush(stderr);
             skin_debug_last = mode;
         }
@@ -213,8 +213,8 @@ class VitaGpu final : public gpu::Backend {
         if (!skin_debug || mode < 0) return;
         glDisable(GL_TEXTURE_2D); glColor4f(1, 1, 1, 1);
         glBegin(GL_TRIANGLES);
-        for (int k = 0; k <= mode; ++k) {
-            const float x0 = -0.98f + k * 0.06f, x1 = x0 + 0.04f, y0 = 0.97f, y1 = 0.90f;
+        for (int k = 0; k <= mode; ++k) { // POCKET_GPU_SKIN_V13H: bottom-right, clear of the CPU/FPS overlay
+            const float x1 = 0.97f - k * 0.10f, x0 = x1 - 0.07f, y0 = -0.82f, y1 = -0.95f;
             glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x0, y1);
             glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1);
         }
@@ -282,7 +282,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(skin_program);
         if (u_sampler >= 0) glUniform1i(u_sampler, 0);
         glUseProgram(0);
-        std::fprintf(stderr, "[gpu-skin] v13g program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v13h program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -356,6 +356,7 @@ public:
             for (GLuint i = 0; i < 5; ++i) glEnableVertexAttribArray(i);
             skin_bound = true; // uniform values stay with the program (GL semantics), no re-upload needed
         }
+        if (debug == 4) { skin_bone_gen = skin_light_gen = skin_xform_gen = ~0ull; skin_bone_count = ~0u; }
         if (ge.bone_generation() != skin_bone_gen || f.weights != skin_bone_count) {
             pocket::skin::fill_bones(ge, f.weights, skin_u);
             glUniform4fv(u_bones, 24, &skin_u.bones[0][0]);
@@ -400,40 +401,15 @@ public:
         glVertexAttribPointer(3, 3, GL_BYTE, GL_FALSE, stride, base + 12);
         glVertexAttribPointer(4, 3, GL_SHORT, GL_FALSE, stride, base + 16);
         const GLenum mode = type == 3 ? GL_TRIANGLES : type == 4 ? GL_TRIANGLE_STRIP : GL_TRIANGLE_FAN;
-        if (debug >= 2) {
-            const GLboolean cull = glIsEnabled(GL_CULL_FACE), depth = glIsEnabled(GL_DEPTH_TEST);
-            if (debug == 2) glDisable(GL_CULL_FACE);
-            if (debug == 5) glDisable(GL_DEPTH_TEST);
-            if (debug == 6) {
-                skin_linear.resize(count);
-                for (unsigned i = 0; i < count; ++i) skin_linear[i] = skin_vertices[f.index ? skin_indices[i] : i];
-                const auto *lb = reinterpret_cast<const std::uint8_t *>(skin_linear.data());
-                glVertexAttribPointer(0, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, lb + 0);
-                glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, lb + 4);
-                glVertexAttribPointer(2, 2, GL_UNSIGNED_SHORT, GL_FALSE, stride, lb + 8);
-                glVertexAttribPointer(3, 3, GL_BYTE, GL_FALSE, stride, lb + 12);
-                glVertexAttribPointer(4, 3, GL_SHORT, GL_FALSE, stride, lb + 16);
-                glDrawArrays(mode, 0, GLsizei(count));
-            } else if (debug == 7) {
-                skin_list.clear();
-                const auto at = [&](unsigned i) -> std::uint16_t { return f.index ? skin_indices[i] : std::uint16_t(i); };
-                for (unsigned i = 0; i + 2 < count; i += (type == 3 ? 3u : 1u)) {
-                    if (type == 3) { skin_list.push_back(at(i)); skin_list.push_back(at(i + 1)); skin_list.push_back(at(i + 2)); }
-                    else if (type == 4) { // GL strip winding: odd triangles swap their first two vertices
-                        if (i & 1u) { skin_list.push_back(at(i + 1)); skin_list.push_back(at(i)); }
-                        else { skin_list.push_back(at(i)); skin_list.push_back(at(i + 1)); }
-                        skin_list.push_back(at(i + 2));
-                    } else { skin_list.push_back(at(0)); skin_list.push_back(at(i + 1)); skin_list.push_back(at(i + 2)); }
-                }
-                glDrawElements(GL_TRIANGLES, GLsizei(skin_list.size()), GL_UNSIGNED_SHORT, skin_list.data());
-            } else if (f.index) glDrawElements(mode, GLsizei(count), GL_UNSIGNED_SHORT, skin_indices.data());
-            else glDrawArrays(mode, 0, GLsizei(count));
-            if (debug == 2 && cull) glEnable(GL_CULL_FACE);
-            if (debug == 5 && depth) glEnable(GL_DEPTH_TEST);
-        } else {
+        if (debug != 2) {
             pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
             if (f.index) glDrawElements(mode, GLsizei(count), GL_UNSIGNED_SHORT, skin_indices.data());
             else glDrawArrays(mode, 0, GLsizei(count));
+        }
+        if (debug == 3) {
+            ffp_program();
+            glMatrixMode(GL_PROJECTION); glLoadIdentity(); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+            prepared = false; state_valid = false;
         }
         ++skin_profile.draws; skin_profile.vertices += span;
         return true;
@@ -820,7 +796,7 @@ public:
         if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-weighted-only.flag", "rb")) { std::fclose(f); skin_rigid = false; }
         if (FILE *f = std::fopen("ux0:data/pocketprobe/no-skin-check.flag", "rb")) { std::fclose(f); skin_check = false; }
         if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-debug.flag", "rb")) { std::fclose(f); skin_debug = true; }
-        std::fprintf(stderr, "[gpu-skin] v13g debug cycle %s\n", skin_debug ? "ON (skin-debug.flag): 8 variants x 8 s, white squares top-left" : "off");
+        std::fprintf(stderr, "[gpu-skin] v13h debug cycle %s\n", skin_debug ? "ON (skin-debug.flag): 5 variants x 10 s, white squares bottom-right" : "off");
         std::fprintf(stderr, "[gpu-skin] v13e self-check %s (1 draw in 32 compared with the CPU transform)\n", skin_check ? "on" : "off");
         std::fprintf(stderr, "[gpu-skin] v13f GPU only for draws needing no PSP clipping; models without weights: %s\n",
                      skin_rigid ? "GPU path" : "CPU (skin-weighted-only.flag)");
