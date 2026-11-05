@@ -185,6 +185,8 @@ class VitaGpu final : public gpu::Backend {
     std::vector<pocket::skin::Vertex> skin_vertices;
     std::vector<std::uint16_t> skin_indices;
     struct { unsigned draws{}, vertices{}, format{}, prim{}, texgen{}, clear{}, memory{}, transform{}, range{}, rigid{}, rigid_cpu{}, rigid_culled{}; } skin_profile;
+    bool skin_check = true; unsigned skin_check_logged = 0; // POCKET_GPU_SKIN_V13E self-check (no-skin-check.flag: off)
+    struct { unsigned draws{}, vertices{}, bad_pos{}, bad_gl{}, bad_color{}, bad_uv{}; } skin_check_count;
     bool skin_rigid = true; // POCKET_GPU_SKIN_V13D: models without weights also take the GPU path (skin-weighted-only.flag: no)
     void ffp_program() { // back to vitaGL's fixed-function pipeline before any non-skinned draw
         if (!skin_bound) return;
@@ -248,7 +250,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(skin_program);
         if (u_sampler >= 0) glUniform1i(u_sampler, 0);
         glUseProgram(0);
-        std::fprintf(stderr, "[gpu-skin] v13d program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v13e program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -362,6 +364,7 @@ public:
         const unsigned at = ge.reg(0xdb);
         const GLfloat alpha[4] = {(ge.reg(0x22) & 1u) ? 1.0f : 0.0f, float(at & 7u), float((at >> 8) & 255u) / 255, 0};
         glUniform4fv(u_tex, 1, tex); glUniform4fv(u_env, 1, envc); glUniform4fv(u_alpha, 1, alpha);
+        if (skin_check && (skin_profile.draws & 31u) == 0) skin_self_check(ge, f, vaddr, lo, span, type, count);
         const auto *base = reinterpret_cast<const std::uint8_t *>(skin_vertices.data());
         constexpr GLsizei stride = sizeof(pocket::skin::Vertex);
         glVertexAttribPointer(0, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 0);
@@ -379,6 +382,54 @@ public:
         return true;
     }
 private:
+    // POCKET_GPU_SKIN_V13E: every 32nd GPU-skinned draw, up to 8 of its vertices go through the exact CPU transform
+    // and through run_vertex() with the parameters the shader has right now (cached uniforms included). Any
+    // difference is counted and the first ones are logged with the draw's state, to find what the village does
+    // differently from the characters.
+    void skin_self_check(const Ge &ge, const pocket::skin::Format &f, unsigned vaddr, unsigned lo, unsigned span,
+                         unsigned type, unsigned count) {
+        ++skin_check_count.draws;
+        const unsigned n = std::min(span, 8u), step = std::max(1u, span / n);
+        const float *vp = rigid_transform.viewport.data();
+        for (unsigned k = 0; k < n; ++k) {
+            const unsigned i = std::min(span - 1, k * step);
+            const Vertex c = ge.reference_vertex(vaddr + (lo + i) * f.stride);
+            const auto e = pocket::skin::run_vertex(skin_u, skin_vertices[i]);
+            if (!std::isfinite(c.x) || !std::isfinite(c.y) || !std::isfinite(c.z) || !std::isfinite(c.w)) continue;
+            ++skin_check_count.vertices;
+            const float cc[4] = {c.x, c.y, c.z, c.w};
+            float dpos = 0, dgl = 0, dcol = 0, duv = 0;
+            for (int j = 0; j < 4; ++j)
+                dpos = std::max(dpos, std::fabs(cc[j] - e.clip[j]) / std::max({1.0f, std::fabs(cc[j]), std::fabs(e.clip[j])}));
+            if (c.w > 1e-6f) {
+                const float w = c.w, sx = vp[0] * c.x / w + vp[3] - vp[6], sy = vp[1] * c.y / w + vp[4] - vp[7];
+                const float zs = vp[2] * c.z / w + vp[5];
+                const float ref[4] = {(sx * (2.0f / Side) - 1) * w, (1 - sy * (2.0f / Side)) * w,
+                                      (std::clamp(zs, 0.0f, 65535.0f) * (2.0f / 65535) - 1) * w, w};
+                if (c.z + c.w >= 0)
+                    for (int j = 0; j < 4; ++j)
+                        dgl = std::max(dgl, std::fabs(ref[j] - e.gl[j]) / std::max({1.0f, std::fabs(ref[j]), std::fabs(w)}));
+            }
+            const float col[4] = {std::clamp(c.r + c.sr, 0.0f, 255.0f) / 255, std::clamp(c.g + c.sg, 0.0f, 255.0f) / 255,
+                                  std::clamp(c.b + c.sb, 0.0f, 255.0f) / 255, std::clamp(c.a, 0.0f, 255.0f) / 255};
+            for (int j = 0; j < 4; ++j) dcol = std::max(dcol, std::fabs(col[j] - e.color[j]));
+            if (!target_texture)
+                duv = std::max(std::fabs(c.u - e.uv[0]), std::fabs(c.v - e.uv[1])) / std::max({1.0f, std::fabs(c.u), std::fabs(c.v)});
+            const bool bp = dpos > 1e-3f, bg = dgl > 1e-3f, bc = dcol > 3.0f / 255, bu = duv > 1e-3f;
+            skin_check_count.bad_pos += bp; skin_check_count.bad_gl += bg; skin_check_count.bad_color += bc; skin_check_count.bad_uv += bu;
+            if ((bp || bg || bc || bu) && skin_check_logged < 40) {
+                ++skin_check_logged;
+                std::fprintf(stderr, "[skin-check] vt=%06X w=%u n=%d prim=%u count=%u v=%u/%u lit=%u tex=%u | pos %.3g gl %.3g col %.3g uv %.3g\n",
+                    unsigned(f.vt), f.weights, int(f.normal), type, count, i, span, unsigned(ge.reg(0x17) & 1u),
+                    unsigned(ge.reg(0x1e) & 1u), dpos, dgl, dcol, duv);
+                std::fprintf(stderr, "[skin-check]   cpu clip %g %g %g %g rgba %.0f %.0f %.0f %.0f uv %g %g | gpu clip %g %g %g %g gl %g %g %g %g rgba %.0f %.0f %.0f %.0f uv %g %g\n",
+                    c.x, c.y, c.z, c.w, col[0] * 255, col[1] * 255, col[2] * 255, col[3] * 255, c.u, c.v,
+                    e.clip[0], e.clip[1], e.clip[2], e.clip[3], e.gl[0], e.gl[1], e.gl[2], e.gl[3],
+                    e.color[0] * 255, e.color[1] * 255, e.color[2] * 255, e.color[3] * 255, e.uv[0], e.uv[1]);
+                std::fflush(stderr);
+            }
+        }
+    }
     void plain_state() {
         ffp_program();
         glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
@@ -710,6 +761,8 @@ public:
         std::fprintf(stderr, "[gpu-skin] v13 %s; skinning + PSP lighting in a vertex shader for u8-weight/s16 models\n",
                      skin_enabled ? "enabled by gpu-skin.flag" : "off (create gpu-skin.flag to try it)");
         if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-weighted-only.flag", "rb")) { std::fclose(f); skin_rigid = false; }
+        if (FILE *f = std::fopen("ux0:data/pocketprobe/no-skin-check.flag", "rb")) { std::fclose(f); skin_check = false; }
+        std::fprintf(stderr, "[gpu-skin] v13e self-check %s (1 draw in 32 compared with the CPU transform)\n", skin_check ? "on" : "off");
         std::fprintf(stderr, "[gpu-skin] v13d depth clamp like the CPU path; models without weights: %s\n",
                      skin_rigid ? "GPU when no PSP clipping is needed" : "CPU (skin-weighted-only.flag)");
         rigid_scratch.reserve(256);
@@ -983,6 +1036,12 @@ public:
                     skin_profile.clear, skin_profile.memory, skin_profile.transform, skin_profile.range,
                     skin_profile.rigid, skin_profile.rigid_cpu, skin_profile.rigid_culled);
                 skin_profile = {};
+                if (skin_check) {
+                    std::fprintf(stderr, "[skin-check] period: draws=%u vertices=%u bad: position=%u gl=%u colour=%u uv=%u\n",
+                        skin_check_count.draws, skin_check_count.vertices, skin_check_count.bad_pos, skin_check_count.bad_gl,
+                        skin_check_count.bad_color, skin_check_count.bad_uv);
+                    skin_check_count = {};
+                }
             }
             std::fprintf(stderr, "[gpu-validation] period: full_checks=%u reuses=%u epochs=%u fast_states=%u\n",
                          profile.hash_checks, profile.hash_reuses, profile.invalidations, profile.fast_states);

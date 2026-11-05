@@ -167,6 +167,8 @@ public:
     };
     [[nodiscard]] DecodedVertex decode_vertex(std::uint32_t address) const;
     [[nodiscard]] std::uint32_t vertex_size() const;
+    // POCKET_GPU_SKIN_V13E: the exact CPU transform of one guest vertex (clip space, colours, UV), for backend self-checks.
+    [[nodiscard]] Vertex reference_vertex(std::uint32_t address) const { return transform(decode_vertex(address)); }
 private:
     [[nodiscard]] Vertex transform(const DecodedVertex &in) const;
     void light(const float world_pos[3], const float world_normal[3], Vertex &out, const DecodedVertex &in) const;
