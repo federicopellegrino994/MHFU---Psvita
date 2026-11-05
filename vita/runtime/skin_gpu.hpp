@@ -337,10 +337,36 @@ float4 main(float4 vColor : COLOR, float2 vTexcoord : TEXCOORD0,
         o.a = saturate(o.a);
     }
     if (uAlpha.x > 0.5) {
-        float a = o.a, r = uAlpha.z, f = uAlpha.y;
-        bool pass = f < 0.5 ? false : f < 1.5 ? true : f < 2.5 ? a == r : f < 3.5 ? a != r :
-                    f < 4.5 ? a < r : f < 5.5 ? a <= r : f < 6.5 ? a > r : a >= r;
-        if (!pass) discard;
+        // POCKET_GPU_SKIN_V13C: no reserved words ("pass" is a Cg keyword) and no nested boolean ternaries.
+        float a = o.a;
+        float r = uAlpha.z;
+        float g = uAlpha.y;
+        float keep = 1.0;
+        if (g < 0.5) keep = 0.0;
+        else if (g < 1.5) keep = 1.0;
+        else if (g < 2.5) keep = (a == r) ? 1.0 : 0.0;
+        else if (g < 3.5) keep = (a != r) ? 1.0 : 0.0;
+        else if (g < 4.5) keep = (a < r) ? 1.0 : 0.0;
+        else if (g < 5.5) keep = (a <= r) ? 1.0 : 0.0;
+        else if (g < 6.5) keep = (a > r) ? 1.0 : 0.0;
+        else keep = (a >= r) ? 1.0 : 0.0;
+        if (keep < 0.5) discard;
+    }
+    return o;
+}
+)";
+
+// Used only if kFragmentShader does not compile on the device (the vitaGL build may not keep compiler logs):
+// texture * colour (or colour alone) and the alpha test "greater or equal" / "greater" forms, enough to measure the
+// path and draw most materials correctly. The log says when this one is in use.
+inline constexpr const char *kFragmentShaderSimple = R"(
+float4 main(float4 vColor : COLOR, float2 vTexcoord : TEXCOORD0,
+            uniform sampler2D uTexture, uniform float4 uTex, uniform float4 uAlpha) : COLOR
+{
+    float4 o = vColor;
+    if (uTex.x > 0.5) o = tex2D(uTexture, vTexcoord) * vColor;
+    if (uAlpha.x > 0.5) {
+        if (o.a < uAlpha.z) discard;
     }
     return o;
 }

@@ -215,7 +215,11 @@ class VitaGpu final : public gpu::Backend {
 #define GL_CG_FRAGMENT_SHADER_EXT 0x890F
 #endif
         const GLuint vs = skin_shader(GL_CG_VERTEX_SHADER_EXT, pocket::skin::kVertexShader, "vertex");
-        const GLuint fs = skin_shader(GL_CG_FRAGMENT_SHADER_EXT, pocket::skin::kFragmentShader, "fragment");
+        GLuint fs = skin_shader(GL_CG_FRAGMENT_SHADER_EXT, pocket::skin::kFragmentShader, "fragment");
+        if (!fs && vs) { // POCKET_GPU_SKIN_V13C
+            fs = skin_shader(GL_CG_FRAGMENT_SHADER_EXT, pocket::skin::kFragmentShaderSimple, "fragment (simple)");
+            if (fs) { std::fprintf(stderr, "[gpu-skin] using the SIMPLE fragment shader: texture x colour only, rare texture modes may look different\n"); std::fflush(stderr); }
+        }
         if (!vs || !fs) { std::fprintf(stderr, "[gpu-skin] disabled: CPU path keeps drawing these models\n"); std::fflush(stderr); return false; }
         skin_program = glCreateProgram();
         glAttachShader(skin_program, vs); glAttachShader(skin_program, fs);
@@ -239,11 +243,11 @@ class VitaGpu final : public gpu::Backend {
         u_lamb = loc("uLamb"); u_ldif = loc("uLdif"); u_lspe = loc("uLspe");
         u_mamb = loc("uMamb"); u_mdif = loc("uMdif"); u_mspe = loc("uMspe"); u_base = loc("uBase"); u_params = loc("uParams");
         u_tex = loc("uTex"); u_env = loc("uEnv"); u_alpha = loc("uAlpha"); u_sampler = loc("uTexture");
-        if (u_bones < 0 || u_mvp < 0 || u_params < 0 || u_tex < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); std::fflush(stderr); return false; }
+        if (u_bones < 0 || u_mvp < 0 || u_params < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); std::fflush(stderr); return false; }
         glUseProgram(skin_program);
         if (u_sampler >= 0) glUniform1i(u_sampler, 0);
         glUseProgram(0);
-        std::fprintf(stderr, "[gpu-skin] v13b program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v13c program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
