@@ -8,6 +8,7 @@
 #include "pocket_pixel.hpp"
 #include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
 #include "skin_gpu.hpp"       // POCKET_GPU_SKIN_V13
+#include "pocket_clip.hpp"     // POCKET_PMO_SPLIT_V15
 #include <vitaGL.h>
 #include <unordered_map> // POCKET_GPU_SKIN_V13K
 #include <psp2/kernel/processmgr.h>
@@ -78,6 +79,8 @@ class VitaGpu final : public gpu::Backend {
     bool u8_enabled = true;
     bool pmo_group_gpu=true;
     unsigned pmo_gpu_groups=0,pmo_gpu_boundary=0,pmo_gpu_culled=0;
+    unsigned pmo_split_groups=0,pmo_split_cpu=0,pmo_split_gpu=0; bool pmo_split=true; // POCKET_PMO_SPLIT_V15
+    std::vector<std::uint8_t> pmo_vis; std::vector<GVertex> pmo_clipped;
     struct U8Profile {unsigned attempts{}, draws{}, culled{};} u8_profile;
     struct RigidProfile { unsigned attempts{}, draws{}, vertices{}, state{}, memory{}, clip{}, matrix_splits{}, batches{}, culled_draws{}, culled_vertices{}, outside_near{}, outside_guard{}, boundary{}; } rigid_profile;
     std::array<unsigned, 256> rejected_states{};
@@ -313,10 +316,12 @@ class VitaGpu final : public gpu::Backend {
         state_valid = false; prepared = false; // rebind the real texture state at the next draw
         // POCKET_GPU_BATCH_V14: the shader clamps depth, so PMO groups and rigid draws whose depth leaves 0..65535
         // (most of the quest terrain) can stay on the GPU. Rebuild the transform so the cache sees the change.
+        if (FILE *sf = std::fopen("ux0:data/pocketprobe/no-pmo-split.flag", "rb")) { std::fclose(sf); pmo_split = false; }
+        std::fprintf(stderr, "[pmo-split] v15 %s\n", pmo_split ? "on: PMO groups crossing the near plane are split per triangle" : "off (no-pmo-split.flag)");
         if (FILE *nf = std::fopen("ux0:data/pocketprobe/no-depth-free.flag", "rb")) std::fclose(nf);
         else { rigid_transform.depth_check = false; rigid_transform_valid = false; }
         std::fprintf(stderr, "[gpu-batch] v14 depth range check %s\n", rigid_transform.depth_check ? "kept (no-depth-free.flag)" : "off: shader clamps depth like the PSP");
-        std::fprintf(stderr, "[gpu-plain] v14 ready: one custom program for every draw (no program switches)\n");
+        std::fprintf(stderr, "[gpu-plain] v15 ready: one custom program for every draw (no program switches)\n");
         std::fflush(stderr);
         return true;
     }
@@ -375,7 +380,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(0); bound_program = 0;
         // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
         if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
-        std::fprintf(stderr, "[gpu-skin] v14 program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v15 program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -946,6 +951,7 @@ public:
         bool box_safe=true;
         for(unsigned n=0;n<8;++n)
             if(!rigid_transform.accepts((n&1)?p.high[0]:p.low[0],(n&2)?p.high[1]:p.low[1],(n&4)?p.high[2]:p.low[2])) {box_safe=false;break;}
+        if(!box_safe && pmo_split && plain_active() && plain_enabled) return draw_split_group(ge,p,us,vs,uo,vo);
         if(!box_safe) {
             bool all_safe=true,all_outside=true;
             for(const auto &v:p.vertices) {
@@ -981,6 +987,73 @@ public:
             if(batch.size()>=12288)draw_batch();
         }
         ++pmo_gpu_groups;return true;
+    }
+    // POCKET_PMO_SPLIT_V15: a PMO group that crosses the near plane or the guard band. Before, one such vertex
+    // sent the WHOLE group (the quest ground around the player, ~100 groups a frame) to the CPU path. Now each
+    // triangle is decided alone: inside -> GPU as before; certainly rejected by the PSP -> dropped; otherwise
+    // clipped on the CPU exactly like Ge::draw_triangle (pocket::clip, tested against Ge) and drawn as screen
+    // vertices. Without blending the clipped triangles are drawn after the group's GPU triangles; with blending
+    // the original order is kept.
+    bool draw_split_group(const Ge &ge,const pocket::pmo::Geometry &p,float us,float vs,float uo,float vo) {
+        using V=pocket::rigid::Transform::Visibility;
+        const std::size_t nv=p.vertices.size();
+        pmo_vis.resize(nv);
+        bool any_safe=false,any_boundary=false;
+        for(std::size_t i=0;i<nv;++i) {
+            const auto &v=p.vertices[i];
+            const std::int16_t xyz[]={static_cast<std::int16_t>(v.position[0]*32768.0f),
+                static_cast<std::int16_t>(v.position[1]*32768.0f),static_cast<std::int16_t>(v.position[2]*32768.0f)};
+            const auto c=visibility_cache.classify(reinterpret_cast<const std::uint8_t*>(xyz));
+            pmo_vis[i]=static_cast<std::uint8_t>(c);
+            any_safe|=c==V::Safe; any_boundary|=c==V::Boundary;
+        }
+        if(!any_safe&&!any_boundary) { if(!rigid_cull)return false; ++pmo_gpu_culled; return true; }
+        prepared=false;++serial;prepare(ge);
+        const bool keep_order=(ge.reg(0x21)&1u)!=0;
+        const auto &M=rigid_transform.clip;
+        auto uv_fix=[&](float &u,float &v){ if(target_texture){u*=float(texture_width)/Side;v=1-v*(float(texture_height)/Side);} };
+        auto clip_vertex=[&](const pocket::pmo::Input &v){
+            const float x=v.position[0],y=v.position[1],z=v.position[2];
+            return pocket::clip::ClipVertex{M[0]*x+M[4]*y+M[8]*z+M[12],M[1]*x+M[5]*y+M[9]*z+M[13],
+                M[2]*x+M[6]*y+M[10]*z+M[14],M[3]*x+M[7]*y+M[11]*z+M[15],
+                v.uv[0]*us+uo,v.uv[1]*vs+vo,v.color[0],v.color[1],v.color[2],v.color[3]};
+        };
+        pmo_clipped.clear();
+        unsigned gpu_tris=0,cpu_tris=0;
+        for(unsigned i=0;i+2<p.triangles.size();i+=3) {
+            const unsigned ia=p.triangles[i],ib=p.triangles[i+1],ic=p.triangles[i+2];
+            const V a=V(pmo_vis[ia]),b=V(pmo_vis[ib]),c=V(pmo_vis[ic]);
+            if(a==V::Safe&&b==V::Safe&&c==V::Safe) {
+                begin_batch(true,&rigid_transform.gpu);
+                const auto &last=p.vertices[ic];
+                for(unsigned k:{ia,ib,ic}) {
+                    const auto &v=p.vertices[k];GVertex out;
+                    std::copy_n(v.position,4,out.position);std::copy_n(flat?last.color:v.color,4,out.color);
+                    out.uv[0]=v.uv[0]*us+uo;out.uv[1]=v.uv[1]*vs+vo;uv_fix(out.uv[0],out.uv[1]);
+                    batch.push_back(out);
+                }
+                ++gpu_tris;
+                if(batch.size()>=12288)draw_batch();
+                continue;
+            }
+            if(a==V::OutsideGuard||b==V::OutsideGuard||c==V::OutsideGuard)continue; // the PSP drops it
+            if(a==V::OutsideNear&&b==V::OutsideNear&&c==V::OutsideNear)continue;    // entirely behind the near plane
+            const pocket::clip::ClipVertex cv[3]={clip_vertex(p.vertices[ia]),clip_vertex(p.vertices[ib]),clip_vertex(p.vertices[ic])};
+            ++cpu_tris;
+            auto emit=[&](const pocket::clip::GlVertex &g){
+                GVertex out; std::copy_n(g.position,4,out.position); std::copy_n(g.color,4,out.color);
+                out.uv[0]=g.uv[0];out.uv[1]=g.uv[1];uv_fix(out.uv[0],out.uv[1]);
+                if(keep_order){ begin_batch(false); batch.push_back(out); if(batch.size()>=12288)draw_batch(); }
+                else pmo_clipped.push_back(out);
+            };
+            pocket::clip::triangle(rigid_transform.viewport,cv,flat,float(Side),1.0f,emit);
+        }
+        if(!pmo_clipped.empty()) {
+            begin_batch(false);
+            for(const auto &v:pmo_clipped){ batch.push_back(v); if(batch.size()>=12288)draw_batch(); }
+        }
+        ++pmo_split_groups; pmo_split_gpu+=gpu_tris; pmo_split_cpu+=cpu_tris;
+        return true;
     }
     bool draw_rigid(const Ge &ge, unsigned type, unsigned count, unsigned vaddr, unsigned iaddr) override {
         if (!rigid_enabled) return false;
@@ -1223,8 +1296,9 @@ public:
             std::fprintf(stderr,"[gpu-u8] period: attempts=%u draws=%u culled=%u fallback=%u\n",
                 u8_profile.attempts,u8_profile.draws,u8_profile.culled,
                 u8_profile.attempts-u8_profile.draws-u8_profile.culled);
-            std::fprintf(stderr,"[pmo-native-gpu] period: groups=%u culled=%u boundary_to_cpu=%u\n",pmo_gpu_groups,pmo_gpu_culled,pmo_gpu_boundary);
-            pmo_gpu_groups=pmo_gpu_culled=pmo_gpu_boundary=0;
+            std::fprintf(stderr,"[pmo-native-gpu] period: groups=%u culled=%u boundary_to_cpu=%u | split groups=%u triangles gpu=%u clipped_on_cpu=%u\n",
+                pmo_gpu_groups,pmo_gpu_culled,pmo_gpu_boundary,pmo_split_groups,pmo_split_gpu,pmo_split_cpu);
+            pmo_gpu_groups=pmo_gpu_culled=pmo_gpu_boundary=0; pmo_split_groups=pmo_split_gpu=pmo_split_cpu=0;
             u8_profile={};
             for (unsigned mask = 0; mask < rejected_states.size(); ++mask)
                 if (rejected_states[mask])
