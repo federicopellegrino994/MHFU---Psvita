@@ -203,10 +203,9 @@ class VitaGpu final : public gpu::Backend {
         // POCKET_GPU_SKIN_V13H: 5 variants x 10 s.
         const int mode = int(std::chrono::duration<float>(now - skin_debug_start).count() / 10.0f) % 5;
         if (mode != skin_debug_last) {
-            static const char *names[5] = {"0 GPU skin OFF (CPU path, reference)", "1 GPU skin normal",
-                "2 GPU skin computed but NOT drawn (shows which geometry it owns)",
-                "3 GPU skin + full fixed-function state reset after every skinned draw",
-                "4 GPU skin, every uniform uploaded on every draw (no caching)"};
+            static const char *names[5] = {"0 plain shader normal", "1 plain shader, colour doubling ignored",
+                "2 plain shader, texture off (vertex colours only)", "3 plain shader, texture only (no vertex colour)",
+                "4 GPU skin OFF (characters on the CPU path), plain shader normal"}; // POCKET_GPU_SKIN_V13J
             std::fprintf(stderr, "[skin-debug] variant %s (%d white squares)\n", names[mode], mode + 1); std::fflush(stderr);
             skin_debug_last = mode;
         }
@@ -214,7 +213,18 @@ class VitaGpu final : public gpu::Backend {
     }
     void skin_debug_marker() {
         const int mode = skin_debug_last;
-        if (!skin_debug || mode < 0 || plain_active()) return;
+        if (!skin_debug || mode < 0) return;
+        if (plain_active()) { // POCKET_GPU_SKIN_V13J: squares through the plain program
+            GVertex q[30]; int n = 0;
+            for (int k = 0; k <= mode && k < 5; ++k) {
+                const float x1 = 0.97f - k * 0.10f, x0 = x1 - 0.07f, y0 = -0.82f, y1 = -0.95f;
+                const float c[6][2] = {{x0, y0}, {x1, y0}, {x0, y1}, {x1, y0}, {x1, y1}, {x0, y1}};
+                for (auto &xy : c) q[n++] = GVertex{{xy[0], xy[1], 0, 1}, {1, 1, 1, 1}, {0, 0}};
+            }
+            frag_tex[0] = 0; frag_alpha[0] = 0;
+            plain_draw(GL_TRIANGLES, q, n, nullptr, false);
+            return;
+        }
         glDisable(GL_TEXTURE_2D); glColor4f(1, 1, 1, 1);
         glBegin(GL_TRIANGLES);
         for (int k = 0; k <= mode; ++k) { // POCKET_GPU_SKIN_V13H: bottom-right, clear of the CPU/FPS overlay
@@ -251,11 +261,17 @@ class VitaGpu final : public gpu::Backend {
         bound_program = 2; skin_bound = false;
     }
     // One GVertex array through the plain program with the current GL state and the batch's fragment parameters.
-    void plain_draw(GLenum mode, const GVertex *v, GLsizei n, const GLfloat matrix[16]) {
+    void plain_draw(GLenum mode, const GVertex *v, GLsizei n, const GLfloat matrix[16], bool variant = true) {
         use_plain_program();
         static const GLfloat identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
         glUniform4fv(p_mat, 4, matrix ? matrix : identity);
-        glUniform4fv(p_tex, 1, frag_tex); glUniform4fv(p_env, 1, frag_env); glUniform4fv(p_alpha, 1, frag_alpha);
+        GLfloat tex[4] = {frag_tex[0], frag_tex[1], frag_tex[2], frag_tex[3]};
+        if (variant && skin_debug) { // POCKET_GPU_SKIN_V13J
+            if (skin_debug_last == 1) tex[3] = 1;
+            if (skin_debug_last == 2) tex[0] = 0;
+            if (skin_debug_last == 3 && tex[0] > 0.5f) { tex[1] = 3; tex[2] = 1; tex[3] = 1; }
+        }
+        glUniform4fv(p_tex, 1, tex); glUniform4fv(p_env, 1, frag_env); glUniform4fv(p_alpha, 1, frag_alpha);
         constexpr GLsizei stride = sizeof(GVertex);
         glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, v[0].position);
         glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, v[0].color);
@@ -351,7 +367,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(0); bound_program = 0;
         // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
         if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
-        std::fprintf(stderr, "[gpu-skin] v13i program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v13j program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -359,7 +375,7 @@ public:
     bool draw_skinned(const Ge &ge, unsigned type, unsigned count, unsigned vaddr, unsigned iaddr) override {
         if (!skin_enabled) return false;
         const int debug = skin_ready ? skin_debug_mode() : -1;
-        if (debug == 0) return false;
+        if (debug == 4) return false; // POCKET_GPU_SKIN_V13J: variant 4 = skin off
         if (type < 3 || type > 5 || count < 3 || count > 65535) { ++skin_profile.prim; return false; }
         pocket::skin::Format f;
         if (!pocket::skin::format_for(ge.reg(0x12), f)) { ++skin_profile.format; return false; }
@@ -421,7 +437,6 @@ public:
         draw_batch();
         prepared = false; ++serial; prepare(ge);
         use_skin_program();
-        if (debug == 4) { skin_bone_gen = skin_light_gen = skin_xform_gen = ~0ull; skin_bone_count = ~0u; }
         if (ge.bone_generation() != skin_bone_gen || f.weights != skin_bone_count) {
             pocket::skin::fill_bones(ge, f.weights, skin_u);
             glUniform4fv(u_bones, 24, &skin_u.bones[0][0]);
@@ -454,8 +469,6 @@ public:
         const unsigned at = ge.reg(0xdb);
         const GLfloat alpha[4] = {(ge.reg(0x22) & 1u) ? 1.0f : 0.0f, float(at & 7u), float((at >> 8) & 255u) / 255, 0};
         GLfloat tex_used[4] = {tex[0], tex[1], tex[2], tex[3]}, alpha_used[4] = {alpha[0], alpha[1], alpha[2], alpha[3]};
-        if (debug == 3) alpha_used[0] = 0.0f;
-        if (debug == 4) tex_used[0] = 0.0f;
         glUniform4fv(u_tex, 1, tex_used); glUniform4fv(u_env, 1, envc); glUniform4fv(u_alpha, 1, alpha_used);
         if (skin_check && (skin_profile.draws & 31u) == 0) skin_self_check(ge, f, vaddr, lo, span, type, count);
         const auto *base = reinterpret_cast<const std::uint8_t *>(skin_vertices.data());
@@ -466,7 +479,7 @@ public:
         glVertexAttribPointer(3, 3, GL_BYTE, GL_FALSE, stride, base + 12);
         glVertexAttribPointer(4, 3, GL_SHORT, GL_FALSE, stride, base + 16);
         const GLenum mode = type == 3 ? GL_TRIANGLES : type == 4 ? GL_TRIANGLE_STRIP : GL_TRIANGLE_FAN;
-        if (debug != 2) {
+        {
             pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
             if (f.index) glDrawElements(mode, GLsizei(count), GL_UNSIGNED_SHORT, skin_indices.data());
             else glDrawArrays(mode, 0, GLsizei(count));
@@ -825,7 +838,7 @@ private:
             const GVertex q[4] = {{{-1, 1, 0, 1}, {1, 1, 1, 1}, {0, top}}, {{-1, -1, 0, 1}, {1, 1, 1, 1}, {0, bottom}},
                                   {{1, 1, 0, 1}, {1, 1, 1, 1}, {u, top}}, {{1, -1, 0, 1}, {1, 1, 1, 1}, {u, bottom}}};
             frag_tex[0] = 1; frag_tex[1] = 3; frag_tex[2] = 0; frag_tex[3] = 1; frag_alpha[0] = 0;
-            plain_draw(GL_TRIANGLE_STRIP, q, 4, nullptr);
+            plain_draw(GL_TRIANGLE_STRIP, q, 4, nullptr, false);
             return;
         }
         ffp_program(); // POCKET_GPU_SKIN_V13
@@ -878,7 +891,7 @@ public:
         if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-weighted-only.flag", "rb")) { std::fclose(f); skin_rigid = false; }
         if (FILE *f = std::fopen("ux0:data/pocketprobe/no-skin-check.flag", "rb")) { std::fclose(f); skin_check = false; }
         if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-debug.flag", "rb")) { std::fclose(f); skin_debug = true; }
-        std::fprintf(stderr, "[gpu-skin] v13h debug cycle %s\n", skin_debug ? "ON (skin-debug.flag): 5 variants x 10 s, white squares bottom-right" : "off");
+        std::fprintf(stderr, "[gpu-skin] v13j debug cycle %s\n", skin_debug ? "ON (skin-debug.flag): 5 plain-shader variants x 10 s, white squares bottom-right" : "off");
         std::fprintf(stderr, "[gpu-skin] v13e self-check %s (1 draw in 32 compared with the CPU transform)\n", skin_check ? "on" : "off");
         std::fprintf(stderr, "[gpu-skin] v13f GPU only for draws needing no PSP clipping; models without weights: %s\n",
                      skin_rigid ? "GPU path" : "CPU (skin-weighted-only.flag)");
