@@ -36,6 +36,11 @@ enum Ge : std::uint8_t {
     GePresent,         // backend present(): framebuffer to screen, vglSwapBuffers
     GePmo,             // native PMO group path
     GeTransfer,        // block transfers
+    GeSkinCheck,       // POCKET_PHASE_V16C: skin path format/index checks
+    GeSkinPack,        // skin path vertex repack + index list
+    GeSkinUniform,     // skin path parameters (fill + glUniform)
+    GeSkinFlush,       // skin batch flush (GL calls except the draw itself)
+    GeSkinSelf,        // skin self-check
     GeCount
 };
 enum Game : std::uint8_t {
@@ -109,7 +114,7 @@ inline void start_sampler() {
     std::thread([] {
         static const char *const ge_names[GeCount] = {"idle", "loop", "commands", "state", "prim_setup", "rigid",
             "vertices", "light", "assembly", "backend_tri", "prepare", "tex_hash", "tex_upload", "submit", "flush",
-            "present", "pmo", "transfer"};
+            "present", "pmo", "transfer", "skin_check", "skin_pack", "skin_uniform", "skin_flush", "skin_self"};
         static const char *const game_names[GameCount] = {"run", "wait_ge", "idle", "interp", "hle"};
         std::array<std::uint32_t, GeCount> ge{};
         std::array<std::uint32_t, GameCount> game{};

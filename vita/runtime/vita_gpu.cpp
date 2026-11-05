@@ -193,7 +193,7 @@ class VitaGpu final : public gpu::Backend {
     std::vector<pocket::skin::Vertex> skin_vertices;
     std::vector<std::uint16_t> skin_indices;
     struct { unsigned draws{}, vertices{}, format{}, prim{}, texgen{}, clear{}, memory{}, transform{}, range{}, rigid{}, rigid_cpu{}, rigid_culled{}; } skin_profile;
-    bool skin_check = true; unsigned skin_check_logged = 0; // POCKET_GPU_SKIN_V13E self-check (no-skin-check.flag: off)
+    bool skin_check = false; unsigned skin_check_logged = 0; // POCKET_GPU_SKIN_V13E self-check (no-skin-check.flag: off)
     struct { unsigned draws{}, vertices{}, bad_pos{}, bad_gl{}, bad_color{}, bad_uv{}; } skin_check_count;
     struct CensusEntry { unsigned draws{}, vertices{}; std::uint64_t fix{}; unsigned env{}, material{}; };
     std::unordered_map<std::uint64_t, CensusEntry> skin_census; // POCKET_GPU_SKIN_V13K
@@ -254,6 +254,7 @@ class VitaGpu final : public gpu::Backend {
     unsigned sb_slots = 0, skin_gl_draws = 0;
     void flush_skin() {
         if (!sb_slots) return;
+        pocket::phase::GeScope flush_phase(pocket::phase::GeSkinFlush);
         use_skin_program();
         glUniform4fv(u_bones, 24, &sb_bones[0][0]);
         glUniform4fv(u_uv, 1, sb_uv);
@@ -353,7 +354,7 @@ class VitaGpu final : public gpu::Backend {
         if (FILE *nf = std::fopen("ux0:data/pocketprobe/no-depth-free.flag", "rb")) std::fclose(nf);
         else { rigid_transform.depth_check = false; rigid_transform_valid = false; }
         std::fprintf(stderr, "[gpu-batch] v14 depth range check %s\n", rigid_transform.depth_check ? "kept (no-depth-free.flag)" : "off: shader clamps depth like the PSP");
-        std::fprintf(stderr, "[gpu-plain] v16b ready: one custom program for every draw (no program switches)\n");
+        std::fprintf(stderr, "[gpu-plain] v16c ready: one custom program for every draw (no program switches)\n");
         std::fflush(stderr);
         return true;
     }
@@ -412,13 +413,14 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(0); bound_program = 0;
         // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
         if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
-        std::fprintf(stderr, "[gpu-skin] v16b program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v16c program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
 public:
     bool draw_skinned(const Ge &ge, unsigned type, unsigned count, unsigned vaddr, unsigned iaddr) override {
         if (!skin_enabled) return false;
+        pocket::phase::GeScope check_phase(pocket::phase::GeSkinCheck); // POCKET_PHASE_V16C
         const int debug = skin_ready ? skin_debug_mode() : -1;
         if (debug == 4) return false; // POCKET_GPU_SKIN_V13J: variant 4 = skin off
         if (type < 3 || type > 5 || count < 3 || count > 65535) { ++skin_profile.prim; return false; }
@@ -473,6 +475,7 @@ public:
         // triangles in the shared index list. Anything else drawn in between flushes the batch first (order kept).
         if (!batch.empty()) draw_batch();
         prepared = false; ++serial; prepare(ge); // a state change flushes the pending skin batch (prepare -> draw_batch)
+        pocket::phase::GeScope uniform_phase(pocket::phase::GeSkinUniform);
         pocket::skin::fill_uv(ge, target_texture, float(texture_width), float(texture_height), float(Side), skin_u);
         const bool textured = (ge.reg(0x1e) & 1u) != 0;
         const unsigned func = ge.reg(0xc9);
@@ -514,6 +517,7 @@ public:
             sb_bone_gen = ge.bone_generation(); sb_weights = f.weights;
         }
         ++sb_slots;
+        pocket::phase::GeScope pack_phase(pocket::phase::GeSkinPack);
         const unsigned first = static_cast<unsigned>(sb_vertices.size());
         sb_vertices.resize(first + span);
         for (unsigned i = 0; i < span; ++i) {
@@ -533,7 +537,10 @@ public:
             sb_indices.push_back(at_index(i + 2));
         }
         else for (unsigned i = 0; i + 2 < count; ++i) { sb_indices.push_back(at_index(0)); sb_indices.push_back(at_index(i + 1)); sb_indices.push_back(at_index(i + 2)); }
-        if (skin_check && ((skin_profile.draws + frames) & 31u) == 0) skin_self_check(ge, f, vaddr, lo, span, type, count, &sb_vertices[first]);
+        if (skin_check && ((skin_profile.draws + frames) & 31u) == 0) {
+            pocket::phase::GeScope self_phase(pocket::phase::GeSkinSelf);
+            skin_self_check(ge, f, vaddr, lo, span, type, count, &sb_vertices[first]);
+        }
         if (!skin_batching) flush_skin();
         ++skin_profile.draws; skin_profile.vertices += span;
         return true;
@@ -941,7 +948,7 @@ public:
         std::fprintf(stderr, "[gpu-skin] v13 %s; skinning + PSP lighting in a vertex shader for u8-weight/s16 models\n",
                      skin_enabled ? "enabled by gpu-skin.flag" : "off (create gpu-skin.flag to try it)");
         if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-weighted-only.flag", "rb")) { std::fclose(f); skin_rigid = false; }
-        if (FILE *f = std::fopen("ux0:data/pocketprobe/no-skin-check.flag", "rb")) { std::fclose(f); skin_check = false; }
+        if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-check.flag", "rb")) { std::fclose(f); skin_check = true; } // V16C: off by default
         if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-debug.flag", "rb")) { std::fclose(f); skin_debug = true; }
         std::fprintf(stderr, "[gpu-skin] v13j debug cycle %s\n", skin_debug ? "ON (skin-debug.flag): 5 plain-shader variants x 10 s, white squares bottom-right" : "off");
         std::fprintf(stderr, "[gpu-skin] v13e self-check %s (1 draw in 32 compared with the CPU transform)\n", skin_check ? "on" : "off");
