@@ -116,6 +116,39 @@ inline void depth_like_psp(float near_distance, float gl[4]) {
     else gl[2] = std::min(std::max(gl[2], -gl[3]), gl[3]);
 }
 
+// POCKET_GPU_SKIN_V13F: which path a draw may take. The GPU cannot clip exactly where the PSP does (near plane with
+// depth clamped instead of clipped, 4096 guard band), so it only gets draws that need no clipping at all: every
+// vertex in lo..hi, skinned on the CPU (position only, the cheap part), in front of the near plane and inside the
+// guard band. Draws whose vertices are all certainly rejected by the PSP draw nothing. Everything else (typically
+// ground and walls crossing the near plane next to the camera) stays on the exact CPU path.
+enum class Route { Gpu, Cpu, Culled };
+inline Route route(const pocket::rigid::Transform &t, const Ge &ge, const Format &f, const std::uint8_t *src,
+                   unsigned span) {
+    using Visibility = pocket::rigid::Transform::Visibility;
+    float bone[8][12];
+    for (unsigned b = 0; b < f.weights && b < 8u; ++b) std::memcpy(bone[b], ge.bone_matrix(b).m.data(), sizeof bone[b]);
+    bool all_safe = true, all_outside = true;
+    for (unsigned i = 0; i < span; ++i) {
+        const std::uint8_t *v = src + i * f.stride;
+        std::int16_t xyz[3]; std::memcpy(xyz, v + f.p_off, 6);
+        const float x = float(xyz[0]) * (1.0f / 32768), y = float(xyz[1]) * (1.0f / 32768), z = float(xyz[2]) * (1.0f / 32768);
+        float m[3] = {x, y, z};
+        if (f.weights) {
+            float bm[12] = {};
+            for (unsigned b = 0; b < f.weights; ++b) {
+                const float w = float(v[f.w_off + b]) * (1.0f / 128.0f);
+                for (unsigned k = 0; k < 12; ++k) bm[k] += bone[b][k] * w;
+            }
+            for (unsigned r = 0; r < 3; ++r) m[r] = bm[r] * x + bm[3 + r] * y + bm[6 + r] * z + bm[9 + r];
+        }
+        const auto c = t.classify(m[0], m[1], m[2], false);
+        if (c == Visibility::Safe) all_outside = false;
+        else { all_safe = false; if (c == Visibility::Boundary) all_outside = false; }
+        if (!all_safe && !all_outside) return Route::Cpu;
+    }
+    return all_safe ? Route::Gpu : Route::Culled;
+}
+
 // UV scale/offset (texture map mode 0) and the render-target adjustment vita_gpu.cpp's vertex() applies.
 inline void fill_uv(const Ge &ge, bool target_texture, float texture_width, float texture_height, float side,
                     Uniforms &u) {

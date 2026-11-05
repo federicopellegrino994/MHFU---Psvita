@@ -250,7 +250,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(skin_program);
         if (u_sampler >= 0) glUniform1i(u_sampler, 0);
         glUseProgram(0);
-        std::fprintf(stderr, "[gpu-skin] v13e program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v13f program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -291,28 +291,14 @@ public:
         if (span > 65535u) { ++skin_profile.range; return false; }
         const std::uint8_t *src = ge.guest_bytes(vaddr + lo * f.stride, span * f.stride);
         if (!src) { ++skin_profile.memory; return false; }
-        if (!f.weights) {
-            // POCKET_GPU_SKIN_V13D: static lit models (village buildings, terrain pieces) as the rigid path treats them:
-            // the GPU only takes draws needing no PSP clipping (in front of the near plane, inside the 4096 guard band),
-            // draws certainly rejected by the PSP are dropped, everything else stays on the exact CPU path. Depth outside
-            // 0..65535 is fine here: the shader clamps it like the CPU path.
-            if (!skin_rigid) { ++skin_profile.rigid_cpu; return false; }
-            bool all_safe = true, all_outside = true;
-            using Visibility = pocket::rigid::Transform::Visibility;
-            for (unsigned i = 0; i < span; ++i) {
-                std::int16_t xyz[3]; std::memcpy(xyz, src + i * f.stride + f.p_off, 6);
-                const auto v = rigid_transform.classify(float(xyz[0]) * (1.0f / 32768), float(xyz[1]) * (1.0f / 32768),
-                                                        float(xyz[2]) * (1.0f / 32768), false);
-                if (v == Visibility::Safe) all_outside = false;
-                else { all_safe = false; if (v == Visibility::Boundary) all_outside = false; }
-                if (!all_safe && !all_outside) break;
-            }
-            if (!all_safe) {
-                // Every vertex in lo..hi is outside: the used ones are too, so the PSP draws nothing.
-                if (all_outside) { ++skin_profile.rigid_culled; return true; }
-                ++skin_profile.rigid_cpu; return false;
-            }
-            ++skin_profile.rigid;
+        // POCKET_GPU_SKIN_V13F: only draws that need no PSP clipping go to the GPU, skinned or not (see skin::route()).
+        // v13d did this for models without weights only; the village ground and walls are skinned models too, and
+        // the GPU cut them at the wrong place next to the camera.
+        if (!f.weights && !skin_rigid) { ++skin_profile.rigid_cpu; return false; }
+        switch (pocket::skin::route(rigid_transform, ge, f, src, span)) {
+        case pocket::skin::Route::Cpu: ++skin_profile.rigid_cpu; return false;
+        case pocket::skin::Route::Culled: ++skin_profile.rigid_culled; return true;
+        case pocket::skin::Route::Gpu: ++skin_profile.rigid; break;
         }
         if (skin_vertices.size() < span) skin_vertices.resize(span);
         for (unsigned i = 0; i < span; ++i) pocket::skin::repack(src + i * f.stride, f, skin_vertices[i]);
@@ -763,8 +749,8 @@ public:
         if (FILE *f = std::fopen("ux0:data/pocketprobe/skin-weighted-only.flag", "rb")) { std::fclose(f); skin_rigid = false; }
         if (FILE *f = std::fopen("ux0:data/pocketprobe/no-skin-check.flag", "rb")) { std::fclose(f); skin_check = false; }
         std::fprintf(stderr, "[gpu-skin] v13e self-check %s (1 draw in 32 compared with the CPU transform)\n", skin_check ? "on" : "off");
-        std::fprintf(stderr, "[gpu-skin] v13d depth clamp like the CPU path; models without weights: %s\n",
-                     skin_rigid ? "GPU when no PSP clipping is needed" : "CPU (skin-weighted-only.flag)");
+        std::fprintf(stderr, "[gpu-skin] v13f GPU only for draws needing no PSP clipping; models without weights: %s\n",
+                     skin_rigid ? "GPU path" : "CPU (skin-weighted-only.flag)");
         rigid_scratch.reserve(256);
         std::fprintf(stderr,"[gpu-rigid] v12 %s; VTYPE 00111A + optional 00091A; GPU matrix transform with conservative CPU clipping checks\n",rigid_enabled?"enabled":"disabled by flag");
         vglWaitVblankStart(GL_FALSE);
@@ -1031,7 +1017,7 @@ public:
             std::fprintf(stderr, "[gpu-count] period: requests=%u hits=%u misses=%u draws=%u triangles=%u reused_states=%u\n",
                 profile.requests, profile.hits, profile.misses, profile.draws, profile.triangles, profile.reused);
             if (skin_enabled || skin_tried) {
-                std::fprintf(stderr, "[gpu-skin] period: draws=%u vertices=%u rejected: format=%u prim=%u texgen=%u clear=%u memory=%u transform=%u range=%u | no-weight gpu=%u cpu=%u culled=%u\n",
+                std::fprintf(stderr, "[gpu-skin] period: draws=%u vertices=%u rejected: format=%u prim=%u texgen=%u clear=%u memory=%u transform=%u range=%u | clip check: gpu=%u cpu=%u culled=%u\n",
                     skin_profile.draws, skin_profile.vertices, skin_profile.format, skin_profile.prim, skin_profile.texgen,
                     skin_profile.clear, skin_profile.memory, skin_profile.transform, skin_profile.range,
                     skin_profile.rigid, skin_profile.rigid_cpu, skin_profile.rigid_culled);
