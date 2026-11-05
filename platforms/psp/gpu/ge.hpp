@@ -69,6 +69,7 @@ public:
     void set_backend(Backend *backend) noexcept { backend_ = backend; }
     void geometry_probe_present() {
         geometry_probe_.present();
+        ++pmo_groups_.frame; // POCKET_PMO_FRAME_CHECK_V12: called once per presented frame on the GE worker
         if (std::chrono::steady_clock::now() - transform_cache_report_ >= std::chrono::seconds(5)) {
             transform_cache_report_ = std::chrono::steady_clock::now();
             std::fprintf(stderr, "[cpu-transform-cache] hits=%llu misses=%llu\n",
@@ -80,8 +81,8 @@ public:
         const auto now=std::chrono::steady_clock::now();
         if(now-pmo_report_time_>=std::chrono::seconds(5) && pocket::pmo::producer_calls.load()) {
             const auto &c=pmo_groups_.counts;
-            std::fprintf(stderr,"[pmo-native-ge] totals: producer=%u producer_fallback=%u groups=%u hits=%u builds=%u changed=%u denied=%u unsupported=%u gpu=%u cpu=%u bytes=%u\n",
-                pocket::pmo::producer_calls.load(),pocket::pmo::producer_fallbacks.load(),c.groups,c.hits,c.builds,c.changed,c.denied,c.unsupported,c.gpu,c.cpu,static_cast<unsigned>(pmo_groups_.used));
+            std::fprintf(stderr,"[pmo-native-ge] totals: producer=%u producer_fallback=%u groups=%u hits=%u builds=%u changed=%u denied=%u unsupported=%u gpu=%u cpu=%u bytes=%u same_frame_hits=%u\n",
+                pocket::pmo::producer_calls.load(),pocket::pmo::producer_fallbacks.load(),c.groups,c.hits,c.builds,c.changed,c.denied,c.unsupported,c.gpu,c.cpu,static_cast<unsigned>(pmo_groups_.used),c.same_frame);
             pmo_report_time_=now;
         }
     }
@@ -125,6 +126,12 @@ private:
     void draw_primitive(std::uint32_t data);
     bool native_group(std::uint32_t target,std::uint32_t stall);
     pocket::pmo::GroupCache pmo_groups_;
+    // POCKET_FAST_TRIS_V12: scratch for draw_fast_triangles (one entry per primitive vertex).
+    std::vector<Vertex> fast_screen_;
+    std::vector<std::uint8_t> fast_class_;
+    std::vector<std::uint16_t> fast_index_;
+    bool fast_tris_enabled_ = true; // false with ux0:data/pocketprobe/no-fast-tris.flag
+    void draw_fast_triangles(const std::vector<Vertex> &verts, unsigned type);
     struct TransformCacheEntry {
         std::uint64_t generation = ~std::uint64_t(0);
         std::uint32_t address{};

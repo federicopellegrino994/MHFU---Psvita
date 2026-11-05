@@ -76,8 +76,14 @@ template<class Memory> bool produce(Memory&mem,unsigned self,unsigned tmh,unsign
 // immutable decode from that snapshot. No eviction scan and no rebuild loop
 // at saturation: unsupported/new entries then use the existing GE path.
 struct GroupCache {
-    struct Entry {Region region;std::vector<std::uint8_t> source;std::unique_ptr<Geometry> geometry;unsigned changes{};bool rejected{};};
-    struct Counts {unsigned hits{},builds{},changed{},denied{},unsupported{},gpu{},cpu{},groups{};} counts;
+    // POCKET_PMO_FRAME_CHECK_V12: validated_frame records the frame in which the snapshot was last compared with
+    // guest memory. Later uses in the same frame skip the full memcmp; the first use of every frame still compares
+    // every byte, so a change made by the game between frames is still detected before the next draw.
+    struct Entry {Region region;std::vector<std::uint8_t> source;std::unique_ptr<Geometry> geometry;unsigned changes{};bool rejected{};
+        std::uint32_t validated_frame{0xffffffffu};};
+    struct Counts {unsigned hits{},builds{},changed{},denied{},unsupported{},gpu{},cpu{},groups{},same_frame{};} counts;
+    std::uint32_t frame{0};          // bumped by Ge once per presented frame (GE worker thread)
+    bool frame_check{true};          // false with ux0:data/pocketprobe/no-pmo-frame-check.flag
     std::map<unsigned,Entry> entries;
     std::size_t used{};
     bool allocation_blocked=false;
@@ -106,8 +112,9 @@ struct GroupCache {
         auto &e=it->second;
         if(e.region!=r){used-=bytes(e);e=Entry{};e.region=r;}
         if(e.rejected){++counts.denied;return nullptr;}
+        if(frame_check && e.geometry && e.validated_frame==frame && e.source.size()==r.bytes){++counts.hits;++counts.same_frame;return e.geometry.get();}
         const auto *live=read(r.start,r.bytes);if(!live)return nullptr;
-        if(e.geometry && e.source.size()==r.bytes && std::memcmp(e.source.data(),live,r.bytes)==0){++counts.hits;return e.geometry.get();}
+        if(e.geometry && e.source.size()==r.bytes && std::memcmp(e.source.data(),live,r.bytes)==0){++counts.hits;e.validated_frame=frame;return e.geometry.get();}
         if(e.geometry) {
             used-=bytes(e);e.geometry.reset();std::vector<std::uint8_t>().swap(e.source);++counts.changed;
             if(++e.changes>=4){e.rejected=true;++counts.denied;return nullptr;}
@@ -121,7 +128,7 @@ struct GroupCache {
         if(!compile_group(r.start,r.bytes,r.start,snapshot,*p)){std::vector<std::uint8_t>().swap(e.source);e.rejected=true;++counts.unsupported;return nullptr;}
         e.geometry=std::move(p);
         if(bytes(e)>Budget-used){e.geometry.reset();std::vector<std::uint8_t>().swap(e.source);e.rejected=true;++counts.denied;return nullptr;}
-        used+=bytes(e);++counts.builds;return e.geometry.get();
+        used+=bytes(e);++counts.builds;e.validated_frame=frame;return e.geometry.get();
     }
 };
 } // namespace pocket::pmo

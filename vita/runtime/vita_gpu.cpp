@@ -681,6 +681,30 @@ public:
         batch.push_back(vertex(ge, b, flat ? c : b)); batch.push_back(vertex(ge, c, c));
         if (batch.size() >= 12288) draw_batch();
     }
+    // POCKET_FAST_TRIS_V12: identical to triangle() per triangle, but each shared vertex is converted once.
+    bool wants_unclipped() const override { return false; } // triangle_unclipped() is not used by this backend
+    void triangles(const Ge &ge, const Vertex *v, unsigned count, const std::uint16_t *index, unsigned index_count) override {
+        pocket::phase::GeScope tri_phase(pocket::phase::GeBackendTri);
+        if (!prepared) prepare(ge);
+        if (flat) { // the colour of each triangle comes from its last vertex: keep the per-triangle path
+            for (unsigned i = 0; i + 2 < index_count; i += 3) triangle(ge, v[index[i]], v[index[i + 1]], v[index[i + 2]]);
+            return;
+        }
+        if (batch_model) begin_batch(false);
+        if (fast_converted.size() < count) { fast_converted.resize(count); fast_stamp.resize(count, 0); }
+        if (++fast_serial == 0) { std::fill(fast_stamp.begin(), fast_stamp.end(), 0u); fast_serial = 1; }
+        for (unsigned i = 0; i + 2 < index_count; i += 3) {
+            for (unsigned k = 0; k < 3; ++k) {
+                const unsigned at = index[i + k];
+                if (fast_stamp[at] != fast_serial) { fast_converted[at] = vertex(ge, v[at], v[at]); fast_stamp[at] = fast_serial; }
+                batch.push_back(fast_converted[at]);
+            }
+            if (batch.size() >= 12288) draw_batch();
+        }
+    }
+    std::vector<GVertex> fast_converted;
+    std::vector<std::uint32_t> fast_stamp;
+    std::uint32_t fast_serial = 0;
     void sprite(const Ge &ge, const Vertex &a, const Vertex &b) override {
         pocket::phase::GeScope tri_phase(pocket::phase::GeBackendTri);
         Vertex tl = b, tr = b, bl = b;
@@ -788,6 +812,11 @@ public:
     }
     void sprite(const Ge &g, const Vertex &a, const Vertex &b) override {
         invoke([&]{ gpu->sprite(g,a,b); });
+    }
+    // POCKET_FAST_TRIS_V12
+    bool wants_unclipped() const override { return gpu->wants_unclipped(); }
+    void triangles(const Ge &g, const Vertex *v, unsigned count, const std::uint16_t *index, unsigned index_count) override {
+        invoke([&]{ gpu->triangles(g, v, count, index, index_count); });
     }
     void block_transfer(unsigned s, unsigned ss, unsigned sx, unsigned sy,
                         unsigned d, unsigned ds, unsigned dx, unsigned dy,

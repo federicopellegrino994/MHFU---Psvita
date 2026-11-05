@@ -52,6 +52,14 @@ public:
         (void)b;
         (void)c;
     }
+    // POCKET_FAST_TRIS_V12: several screen-space triangles of one draw that share vertices: `index` holds three
+    // entries per triangle into `vertices` (`count` entries). Must give the same picture as triangle() for each
+    // triangle in order, which is exactly what this default does.
+    virtual void triangles(const Ge &ge, const Vertex *vertices, unsigned count, const std::uint16_t *index,
+                           unsigned index_count); // default in ge.cpp (Vertex is incomplete here)
+    // POCKET_FAST_TRIS_V12: false when triangle_unclipped() does nothing. Only then may the GE group triangles
+    // (it would otherwise reorder triangle_unclipped() and triangle() calls).
+    virtual bool wants_unclipped() const { return true; }
     // A drawing command starts (called even when nothing of it reaches the screen).
     virtual void draw_started(const DrawInfo &draw) { (void)draw; }
     // Axis-aligned rectangle between two corners; color, depth and fog come from `b`.

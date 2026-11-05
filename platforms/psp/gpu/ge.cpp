@@ -135,6 +135,18 @@ Ge::Ge(psprecomp::GuestMemory &memory) {
         transform_cache_enabled_ = false;
     }
     std::fprintf(stderr, "[cpu-xform] v5 enabled; lazy light/matrix caches, per-VTYPE decoder, command flag table\n");
+    if (FILE *flag = std::fopen("ux0:data/pocketprobe/no-pmo-frame-check.flag", "rb")) {
+        std::fclose(flag);
+        pmo_groups_.frame_check = false;
+    }
+    if (FILE *flag = std::fopen("ux0:data/pocketprobe/no-fast-tris.flag", "rb")) {
+        std::fclose(flag);
+        fast_tris_enabled_ = false;
+    }
+    std::fprintf(stderr, "[fast-tris] v12 %s; vertices taken to the screen and converted once per draw\n",
+                 fast_tris_enabled_ ? "enabled" : "disabled by no-fast-tris.flag");
+    std::fprintf(stderr, "[pmo-frame-check] v12 %s; PMO groups are compared with guest memory once per frame\n",
+                 pmo_groups_.frame_check ? "enabled" : "disabled by no-pmo-frame-check.flag");
     std::fprintf(stderr, "[cpu-transform-cache] v4 %s; 256 entries, exact source bytes\n",
                  transform_cache_enabled_ ? "enabled" : "disabled");
 #endif
@@ -175,8 +187,11 @@ bool Ge::native_group(std::uint32_t target,std::uint32_t stall) {
     regs_[kPrim]=p->primitives.front().command&0xffffffu;
     stats_.commands+=p->command_words;stats_.primitives+=p->primitives.size();stats_.vertices+=p->input_vertices;
     ++pmo_groups_.counts.groups;
-    if(backend_->draw_native_group(*this,*p))++pmo_groups_.counts.gpu;
+    bool group_on_gpu=false;
+    { pocket::phase::GeScope gpu_phase(pocket::phase::GeRigid); group_on_gpu=backend_->draw_native_group(*this,*p); }
+    if(group_on_gpu)++pmo_groups_.counts.gpu;
     else {
+        pocket::phase::GeScope cpu_phase(pocket::phase::GeVertices);
         ++pmo_groups_.counts.cpu;
         DrawInfo d;
         d.vertex_address=p->guest_vertices;d.index_address=p->initial_indices;d.vertex_type=p->vertex_type;
@@ -205,6 +220,7 @@ bool Ge::native_group(std::uint32_t target,std::uint32_t stall) {
             pmo_clip_scratch_[n] =
                 (sx >= 0.0f && sx < 4096.0f && sy >= 0.0f && sy < 4096.0f) ? 0 : 2;
         }
+        pocket::phase::ge_phase.store(pocket::phase::GeAssembly, std::memory_order_relaxed);
         for (unsigned n = 0; n + 2 < p->triangles.size(); n += 3) {
             const auto a = p->triangles[n], b = p->triangles[n + 1], c = p->triangles[n + 2];
             const auto flags = pmo_clip_scratch_[a] | pmo_clip_scratch_[b] | pmo_clip_scratch_[c];
@@ -1040,6 +1056,11 @@ void Ge::draw_primitive(std::uint32_t data) {
         if (through) draw_triangle_screen(a, b, c);
         else draw_triangle(a, b, c);
     };
+    // POCKET_FAST_TRIS_V12: 3D triangles, strips and fans whose backend ignores triangle_unclipped().
+    if (fast_tris_enabled_ && !through && (type == 3u || type == 4u || type == 5u) && count >= 3u && count <= 65535u &&
+        backend_ != nullptr && !backend_->wants_unclipped()) {
+        draw_fast_triangles(verts, type);
+    } else
     switch (type) {
     case 0:
         for (const auto &v : verts) draw_point(through ? v : to_screen(v));
@@ -1094,6 +1115,60 @@ void Ge::draw_bezier_or_spline(std::uint32_t cmd, std::uint32_t) {
 // Like the PSP: a triangle is clipped only against the near plane (clip-space z = -w); any other vertex must land
 // inside the GE's 4096x4096 screen coordinate space (before the screen offset), or the whole triangle is dropped.
 // Games rely on this culling: the alternative (clipping at w ~ 0) produces huge stretched triangles.
+// POCKET_FAST_TRIS_V12: the same triangles, in the same order, as draw_triangle() on each triangle of the primitive,
+// but each vertex is classified and taken to the screen once (not once per triangle using it), and the triangles that
+// need no clipping reach the backend together. Per vertex, as in draw_triangle(): behind the near plane -> class 1
+// (the triangle goes through the clipper); in front but outside the 4096 guard band -> class 2 (the triangle is
+// dropped); otherwise class 0. A triangle with any class-2 vertex is dropped even if it also has a class-1 vertex,
+// exactly as draw_triangle() returns at the first in-front vertex outside the guard band.
+void Backend::triangles(const Ge &ge, const Vertex *vertices, unsigned count, const std::uint16_t *index,
+                        unsigned index_count) {
+    (void)count;
+    for (unsigned i = 0; i + 2 < index_count; i += 3)
+        triangle(ge, vertices[index[i]], vertices[index[i + 1]], vertices[index[i + 2]]);
+}
+
+void Ge::draw_fast_triangles(const std::vector<Vertex> &verts, unsigned type) {
+    const unsigned n = static_cast<unsigned>(verts.size());
+    if (viewport_dirty_) rebuild_viewport();
+    const float offset_x = viewport_cache_.ox;
+    const float offset_y = viewport_cache_.oy;
+    if (fast_screen_.size() < n) fast_screen_.resize(n);
+    if (fast_class_.size() < n) fast_class_.resize(n);
+    fast_index_.clear();
+    for (unsigned i = 0; i < n; ++i) {
+        const Vertex &v = verts[i];
+        if (!(v.z > -v.w && v.w > 0.0f)) { fast_class_[i] = 1; continue; }
+        fast_screen_[i] = to_screen(v);
+        const float sx = fast_screen_[i].x + offset_x, sy = fast_screen_[i].y + offset_y;
+        fast_class_[i] = (sx >= 0.0f && sx < 4096.0f && sy >= 0.0f && sy < 4096.0f) ? 0 : 2;
+    }
+    auto flush = [&] {
+        if (fast_index_.empty()) return;
+        backend_->triangles(*this, fast_screen_.data(), n, fast_index_.data(), static_cast<unsigned>(fast_index_.size()));
+        fast_index_.clear();
+    };
+    auto tri = [&](unsigned a, unsigned b, unsigned c) {
+        const unsigned flags = fast_class_[a] | fast_class_[b] | fast_class_[c];
+        if (flags & 2u) return;                              // dropped by the guard band
+        if (flags & 1u) { flush(); draw_triangle(verts[a], verts[b], verts[c]); return; } // keeps draw order
+        fast_index_.push_back(static_cast<std::uint16_t>(a));
+        fast_index_.push_back(static_cast<std::uint16_t>(b));
+        fast_index_.push_back(static_cast<std::uint16_t>(c));
+    };
+    if (type == 3u) {
+        for (unsigned i = 0; i + 2 < n; i += 3) tri(i, i + 1, i + 2);
+    } else if (type == 4u) {
+        for (unsigned i = 0; i + 2 < n; ++i) {
+            if ((i & 1u) == 0) tri(i, i + 1, i + 2);
+            else tri(i + 1, i, i + 2);
+        }
+    } else {
+        for (unsigned i = 1; i + 1 < n; ++i) tri(0, i, i + 1);
+    }
+    flush();
+}
+
 void Ge::draw_triangle(const Vertex &a, const Vertex &b, const Vertex &c) {
     if (backend_ != nullptr) backend_->triangle_unclipped(*this, a, b, c);
     const Vertex *const in[3] = {&a, &b, &c};
