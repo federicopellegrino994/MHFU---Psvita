@@ -9,6 +9,7 @@
 #include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
 #include "skin_gpu.hpp"       // POCKET_GPU_SKIN_V13
 #include <vitaGL.h>
+#include <unordered_map> // POCKET_GPU_SKIN_V13K
 #include <psp2/kernel/processmgr.h>
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <unordered_map>
 
 namespace {
 using namespace mhf::psp;
@@ -191,6 +193,8 @@ class VitaGpu final : public gpu::Backend {
     struct { unsigned draws{}, vertices{}, format{}, prim{}, texgen{}, clear{}, memory{}, transform{}, range{}, rigid{}, rigid_cpu{}, rigid_culled{}; } skin_profile;
     bool skin_check = true; unsigned skin_check_logged = 0; // POCKET_GPU_SKIN_V13E self-check (no-skin-check.flag: off)
     struct { unsigned draws{}, vertices{}, bad_pos{}, bad_gl{}, bad_color{}, bad_uv{}; } skin_check_count;
+    struct CensusEntry { unsigned draws{}, vertices{}; std::uint64_t fix{}; unsigned env{}, material{}; };
+    std::unordered_map<std::uint64_t, CensusEntry> skin_census; // POCKET_GPU_SKIN_V13K
     bool skin_rigid = true;
     // POCKET_GPU_SKIN_V13G: skin-debug.flag cycles 8 variants of the GPU path, 8 seconds each, and draws as many white
     // squares in the top-left corner as the variant number + 1, so a video shows which variant fixes the village.
@@ -367,7 +371,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(0); bound_program = 0;
         // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
         if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
-        std::fprintf(stderr, "[gpu-skin] v13j program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v13k program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -470,7 +474,20 @@ public:
         const GLfloat alpha[4] = {(ge.reg(0x22) & 1u) ? 1.0f : 0.0f, float(at & 7u), float((at >> 8) & 255u) / 255, 0};
         GLfloat tex_used[4] = {tex[0], tex[1], tex[2], tex[3]}, alpha_used[4] = {alpha[0], alpha[1], alpha[2], alpha[3]};
         glUniform4fv(u_tex, 1, tex_used); glUniform4fv(u_env, 1, envc); glUniform4fv(u_alpha, 1, alpha_used);
-        if (skin_check && (skin_profile.draws & 31u) == 0) skin_self_check(ge, f, vaddr, lo, span, type, count);
+        // POCKET_GPU_SKIN_V13K: the phase moves every frame, so over 32 frames every draw of a frame is checked once
+        // (v13e always checked the same draws of each frame and could miss a single odd one).
+        if (skin_check && ((skin_profile.draws + frames) & 31u) == 0) skin_self_check(ge, f, vaddr, lo, span, type, count);
+        { // POCKET_GPU_SKIN_V13K: census of the fragment-side state of skinned draws
+            const std::uint64_t key = std::uint64_t(f.vt & 0xFFFFFFu) | (std::uint64_t(textured) << 24) |
+                (std::uint64_t(func & 7u) << 25) | (std::uint64_t((func >> 8) & 1u) << 28) | (std::uint64_t((func >> 16) & 1u) << 29) |
+                (std::uint64_t(ge.reg(0x21) & 1u) << 30) | (std::uint64_t(ge.reg(0xdf) & 0xFFFu) << 31) |
+                (std::uint64_t(ge.reg(0x22) & 1u) << 43) | (std::uint64_t(ge.reg(0x23) & 1u) << 44) |
+                (std::uint64_t(ge.reg(0xde) & 7u) << 45) | (std::uint64_t(ge.reg(0x17) & 1u) << 48) |
+                (std::uint64_t(ge.reg(0xe7) & 1u) << 49) | (std::uint64_t(ge.reg(0x1f) & 1u) << 50);
+            auto &c = skin_census[key]; ++c.draws; c.vertices += span;
+            const unsigned fix_a = ge.reg(0xe0) & 0xFFFFFFu, fix_b = ge.reg(0xe1) & 0xFFFFFFu;
+            c.fix = (std::uint64_t(fix_a) << 24) | fix_b; c.env = env & 0xFFFFFFu; c.material = ge.reg(0x55) | (ge.reg(0x58) << 24u);
+        }
         const auto *base = reinterpret_cast<const std::uint8_t *>(skin_vertices.data());
         constexpr GLsizei stride = sizeof(pocket::skin::Vertex);
         glVertexAttribPointer(0, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 0);
@@ -1172,6 +1189,20 @@ public:
                         skin_check_count.draws, skin_check_count.vertices, skin_check_count.bad_pos, skin_check_count.bad_gl,
                         skin_check_count.bad_color, skin_check_count.bad_uv);
                     skin_check_count = {};
+                }
+                { // POCKET_GPU_SKIN_V13K: the 16 most frequent fragment states of the skinned draws
+                    std::vector<std::pair<std::uint64_t, CensusEntry>> rows(skin_census.begin(), skin_census.end());
+                    std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.draws > b.second.draws; });
+                    std::fprintf(stderr, "[skin-census] period: %zu states (vt tex func rgba x2 blend mode atest ztest zfunc lit zmask fog | draws vertices fixA fixB env material)\n", rows.size());
+                    for (std::size_t i = 0; i < rows.size() && i < 16; ++i) {
+                        const auto k = rows[i].first; const auto &c = rows[i].second;
+                        std::fprintf(stderr, "[skin-census] %06X t%u f%u a%u d%u b%u m%03X at%u zt%u zf%u l%u zm%u fg%u | %u %u %06X %06X %06X %08X\n",
+                            unsigned(k & 0xFFFFFFu), unsigned((k >> 24) & 1), unsigned((k >> 25) & 7), unsigned((k >> 28) & 1),
+                            unsigned((k >> 29) & 1), unsigned((k >> 30) & 1), unsigned((k >> 31) & 0xFFF), unsigned((k >> 43) & 1),
+                            unsigned((k >> 44) & 1), unsigned((k >> 45) & 7), unsigned((k >> 48) & 1), unsigned((k >> 49) & 1),
+                            unsigned((k >> 50) & 1), c.draws, c.vertices, unsigned(c.fix >> 24), unsigned(c.fix & 0xFFFFFFu), c.env, c.material);
+                    }
+                    skin_census.clear();
                 }
             }
             std::fprintf(stderr, "[gpu-validation] period: full_checks=%u reuses=%u epochs=%u fast_states=%u\n",
