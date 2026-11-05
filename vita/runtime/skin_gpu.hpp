@@ -364,6 +364,21 @@ void main(
 }
 )";
 
+// POCKET_GPU_SKIN_V13I: vertex shader for everything else (CPU-path triangles, rigid and PMO batches, the final
+// screen copy) once the skin path is active. Mixing vitaGL's fixed-function pipeline with custom shaders broke
+// the fixed-function draws after a skinned one (village ground and buildings vanished while the characters were
+// right), so with the skin path on every draw uses a custom program. The vertices are the GVertex batches as they
+// were (clip-space position, colour 0..1, UV); uMat is the batch matrix (identity for CPU-transformed batches).
+inline constexpr const char *kPlainVertexShader = R"(
+void main(float4 aPos, float4 aColor, float2 aUV, uniform float4 uMat[4],
+    float4 out vPosition : POSITION, float4 out vColor : COLOR, float2 out vTexcoord : TEXCOORD0)
+{
+    vPosition = uMat[0] * aPos.x + uMat[1] * aPos.y + uMat[2] * aPos.z + uMat[3] * aPos.w;
+    vColor = aColor;
+    vTexcoord = aUV;
+}
+)";
+
 // The fragment shader: the PSP texture function as vita_gpu.cpp's texture_combiner() sets it up with GL_COMBINE,
 // colour doubling, and the alpha test (custom shaders bypass vitaGL's fixed-function alpha test).
 // uTex: x texturing 0/1, y function 0..4, z RGBA 0/1, w colour scale 1/2. uAlpha: x test 0/1, y function 0..7, z ref.

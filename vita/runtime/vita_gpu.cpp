@@ -25,6 +25,10 @@ namespace {
 using namespace mhf::psp;
 using gpu::Ge;
 using gpu::Vertex;
+#ifndef GL_CG_VERTEX_SHADER_EXT
+#define GL_CG_VERTEX_SHADER_EXT 0x890E
+#define GL_CG_FRAGMENT_SHADER_EXT 0x890F
+#endif
 struct Cost {
     std::uint64_t &total;
     std::chrono::steady_clock::time_point start{};
@@ -210,7 +214,7 @@ class VitaGpu final : public gpu::Backend {
     }
     void skin_debug_marker() {
         const int mode = skin_debug_last;
-        if (!skin_debug || mode < 0) return;
+        if (!skin_debug || mode < 0 || plain_active()) return;
         glDisable(GL_TEXTURE_2D); glColor4f(1, 1, 1, 1);
         glBegin(GL_TRIANGLES);
         for (int k = 0; k <= mode; ++k) { // POCKET_GPU_SKIN_V13H: bottom-right, clear of the CPU/FPS overlay
@@ -220,11 +224,78 @@ class VitaGpu final : public gpu::Backend {
         }
         glEnd();
     } // POCKET_GPU_SKIN_V13D: models without weights also take the GPU path (skin-weighted-only.flag: no)
-    void ffp_program() { // back to vitaGL's fixed-function pipeline before any non-skinned draw
-        if (!skin_bound) return;
+    // POCKET_GPU_SKIN_V13I: which program vitaGL has: 0 fixed function, 1 skin, 2 plain.
+    int bound_program = 0;
+    bool plain_enabled = true;      // no-plain-shader.flag: keep the fixed-function batches (v13h behaviour)
+    GLuint plain_program = 0, white_texture = 0;
+    GLint p_mat = -1, p_tex = -1, p_env = -1, p_alpha = -1, p_sampler = -1;
+    GLfloat frag_tex[4] = {0, 0, 0, 1}, frag_env[4] = {0, 0, 0, 1}, frag_alpha[4] = {0, 0, 0, 0}; // of the batch
+    bool plain_active() const { return skin_ready && plain_program != 0; }
+    void ffp_program() { // back to vitaGL's fixed-function pipeline (only for the init/present helpers without plain)
+        if (bound_program == 0) return;
         glUseProgram(0);
         for (GLuint i = 0; i < 5; ++i) glDisableVertexAttribArray(i);
-        skin_bound = false;
+        bound_program = 0; skin_bound = false;
+    }
+    void use_skin_program() {
+        if (bound_program == 1) return;
+        glUseProgram(skin_program);
+        for (GLuint i = 0; i < 5; ++i) glEnableVertexAttribArray(i);
+        bound_program = 1; skin_bound = true; // uniform values stay with the program (GL semantics)
+    }
+    void use_plain_program() {
+        if (bound_program == 2) return;
+        glUseProgram(plain_program);
+        for (GLuint i = 0; i < 3; ++i) glEnableVertexAttribArray(i);
+        glDisableVertexAttribArray(3); glDisableVertexAttribArray(4);
+        bound_program = 2; skin_bound = false;
+    }
+    // One GVertex array through the plain program with the current GL state and the batch's fragment parameters.
+    void plain_draw(GLenum mode, const GVertex *v, GLsizei n, const GLfloat matrix[16]) {
+        use_plain_program();
+        static const GLfloat identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        glUniform4fv(p_mat, 4, matrix ? matrix : identity);
+        glUniform4fv(p_tex, 1, frag_tex); glUniform4fv(p_env, 1, frag_env); glUniform4fv(p_alpha, 1, frag_alpha);
+        constexpr GLsizei stride = sizeof(GVertex);
+        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, v[0].position);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, v[0].color);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, v[0].uv);
+        glDrawArrays(mode, 0, n);
+    }
+    bool plain_setup() {
+        if (FILE *f = std::fopen("ux0:data/pocketprobe/no-plain-shader.flag", "rb")) {
+            std::fclose(f); plain_enabled = false;
+            std::fprintf(stderr, "[gpu-plain] v13i off (no-plain-shader.flag): fixed-function batches as in v13h\n"); std::fflush(stderr);
+            return true;
+        }
+        const GLuint vs = skin_shader(GL_CG_VERTEX_SHADER_EXT, pocket::skin::kPlainVertexShader, "plain vertex");
+        const GLuint fs = skin_shader(GL_CG_FRAGMENT_SHADER_EXT, pocket::skin::kFragmentShader, "plain fragment");
+        if (!vs || !fs) return false;
+        const GLuint prog = glCreateProgram();
+        glAttachShader(prog, vs); glAttachShader(prog, fs);
+        glBindAttribLocation(prog, 0, "aPos"); glBindAttribLocation(prog, 1, "aColor"); glBindAttribLocation(prog, 2, "aUV");
+        glLinkProgram(prog);
+        GLint ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok) { std::fprintf(stderr, "[gpu-plain] link FAILED\n"); std::fflush(stderr); return false; }
+        auto loc = [&](const char *name) {
+            GLint l = glGetUniformLocation(prog, name);
+            if (l < 0) { char indexed[64]; std::snprintf(indexed, sizeof indexed, "%s[0]", name); l = glGetUniformLocation(prog, indexed); }
+            return l;
+        };
+        p_mat = loc("uMat"); p_tex = loc("uTex"); p_env = loc("uEnv"); p_alpha = loc("uAlpha"); p_sampler = loc("uTexture");
+        if (p_mat < 0 || p_tex < 0 || p_alpha < 0) { std::fprintf(stderr, "[gpu-plain] missing uniforms\n"); std::fflush(stderr); return false; }
+        glUseProgram(prog);
+        if (p_sampler >= 0) glUniform1i(p_sampler, 0);
+        glUseProgram(0); bound_program = 0;
+        // Untextured draws still sample unit 0: give it a real texture.
+        const std::uint32_t white = 0xFFFFFFFFu;
+        glGenTextures(1, &white_texture); glBindTexture(GL_TEXTURE_2D, white_texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &white);
+        plain_program = prog;
+        state_valid = false; prepared = false; // rebind the real texture state at the next draw
+        std::fprintf(stderr, "[gpu-plain] v13i ready: with the GPU skin on, every draw uses custom shaders (no fixed function)\n");
+        std::fflush(stderr);
+        return true;
     }
     static GLuint skin_shader(GLenum type, const char *source, const char *what) {
         const GLuint s = glCreateShader(type);
@@ -245,10 +316,6 @@ class VitaGpu final : public gpu::Backend {
         // POCKET_GPU_SKIN_V13B: vitaGL treats GL_VERTEX_SHADER/GL_FRAGMENT_SHADER sources as GLSL (compiled only at
         // link time, with GL_COMPILE_STATUS reporting success meanwhile); Cg needs the _EXT types. With them the
         // compile happens here and a failure is reported before glLinkProgram can touch a missing program.
-#ifndef GL_CG_VERTEX_SHADER_EXT
-#define GL_CG_VERTEX_SHADER_EXT 0x890E
-#define GL_CG_FRAGMENT_SHADER_EXT 0x890F
-#endif
         const GLuint vs = skin_shader(GL_CG_VERTEX_SHADER_EXT, pocket::skin::kVertexShader, "vertex");
         GLuint fs = skin_shader(GL_CG_FRAGMENT_SHADER_EXT, pocket::skin::kFragmentShader, "fragment");
         if (!fs && vs) { // POCKET_GPU_SKIN_V13C
@@ -281,8 +348,10 @@ class VitaGpu final : public gpu::Backend {
         if (u_bones < 0 || u_mvp < 0 || u_params < 0 || u_near < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); std::fflush(stderr); return false; }
         glUseProgram(skin_program);
         if (u_sampler >= 0) glUniform1i(u_sampler, 0);
-        glUseProgram(0);
-        std::fprintf(stderr, "[gpu-skin] v13h program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        glUseProgram(0); bound_program = 0;
+        // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
+        if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
+        std::fprintf(stderr, "[gpu-skin] v13i program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -351,11 +420,7 @@ public:
         // GL state exactly as for the CPU path (depth, blend, scissor, target, texture binding and filtering).
         draw_batch();
         prepared = false; ++serial; prepare(ge);
-        if (!skin_bound) {
-            glUseProgram(skin_program);
-            for (GLuint i = 0; i < 5; ++i) glEnableVertexAttribArray(i);
-            skin_bound = true; // uniform values stay with the program (GL semantics), no re-upload needed
-        }
+        use_skin_program();
         if (debug == 4) { skin_bone_gen = skin_light_gen = skin_xform_gen = ~0ull; skin_bone_count = ~0u; }
         if (ge.bone_generation() != skin_bone_gen || f.weights != skin_bone_count) {
             pocket::skin::fill_bones(ge, f.weights, skin_u);
@@ -405,11 +470,6 @@ public:
             pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
             if (f.index) glDrawElements(mode, GLsizei(count), GL_UNSIGNED_SHORT, skin_indices.data());
             else glDrawArrays(mode, 0, GLsizei(count));
-        }
-        if (debug == 3) {
-            ffp_program();
-            glMatrixMode(GL_PROJECTION); glLoadIdentity(); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-            prepared = false; state_valid = false;
         }
         ++skin_profile.draws; skin_profile.vertices += span;
         return true;
@@ -635,6 +695,7 @@ private:
         auto &rt = target(target_offset, ge.reg(0x9d) & 0x7fc, ge.reg(0xd2) & 3);
         glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo); glViewport(0, 0, Side, Side);
         plain_state();
+        frag_tex[0] = 0; frag_tex[1] = 0; frag_tex[2] = 0; frag_tex[3] = 1; frag_alpha[0] = 0; // POCKET_GPU_SKIN_V13I
         const int x1 = ge.reg(0xd4) & 1023, y1 = (ge.reg(0xd4) >> 10) & 1023;
         const int x2 = std::min(511u, ge.reg(0xd5) & 1023), y2 = std::min(511u, (ge.reg(0xd5) >> 10) & 1023);
         glEnable(GL_SCISSOR_TEST);
@@ -647,7 +708,7 @@ private:
         if (clear & 1) {
             glColorMask((clear & 0x100) != 0, (clear & 0x100) != 0, (clear & 0x100) != 0, (clear & 0x200) != 0);
             glEnable(GL_DEPTH_TEST); glDepthFunc(GL_ALWAYS); glDepthMask((clear & 0x400) != 0);
-            glDisable(GL_TEXTURE_2D);
+            glDisable(GL_TEXTURE_2D); if (white_texture) glBindTexture(GL_TEXTURE_2D, white_texture);
         } else {
             const unsigned mask = ge.reg(0xe8);
             glColorMask((mask & 255) != 255, ((mask >> 8) & 255) != 255,
@@ -660,6 +721,7 @@ private:
                 const unsigned at = ge.reg(0xdb);
                 if (((at >> 16) & 255) != 255) warn(8, "masked alpha test uses unmasked reference");
                 glEnable(GL_ALPHA_TEST); glAlphaFunc(compare(at), float((at >> 8) & 255) / 255);
+                frag_alpha[0] = 1; frag_alpha[1] = float(at & 7u); frag_alpha[2] = float((at >> 8) & 255u) / 255; // V13I
             }
             if (ge.reg(0x21) & 1) {
                 const unsigned mode = ge.reg(0xdf);
@@ -679,8 +741,12 @@ private:
                 GLfloat color[] = {float(ge.reg(0xca) & 255) / 255, float((ge.reg(0xca) >> 8) & 255) / 255,
                                    float((ge.reg(0xca) >> 16) & 255) / 255, 1};
                 glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, color);
+                { const unsigned func = ge.reg(0xc9); // POCKET_GPU_SKIN_V13I: same parameters as the skin path
+                  frag_tex[0] = 1; frag_tex[1] = float(std::min(4u, func & 7u)); frag_tex[2] = (func & 0x100u) ? 1.0f : 0.0f;
+                  frag_tex[3] = (func & 0x10000u) ? 2.0f : 1.0f;
+                  frag_env[0] = color[0]; frag_env[1] = color[1]; frag_env[2] = color[2]; frag_env[3] = 1; }
 
-            } else glDisable(GL_TEXTURE_2D);
+            } else { glDisable(GL_TEXTURE_2D); if (white_texture) glBindTexture(GL_TEXTURE_2D, white_texture); }
             if (ge.reg(0x24) & 1) warn(32, "PSP stencil operations not implemented");
             if (!through && (ge.reg(0x1f) & 1)) warn(64, "per-vertex PSP fog not implemented");
         }
@@ -723,6 +789,14 @@ private:
     }
     void draw_batch() {
         if (batch.empty()) return;
+        if (plain_active() && plain_enabled) { // POCKET_GPU_SKIN_V13I
+            pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
+            ++profile.draws; profile.triangles += static_cast<unsigned>(batch.size() / 3);
+            if (batch_model) ++rigid_profile.batches;
+            plain_draw(GL_TRIANGLES, batch.data(), static_cast<GLsizei>(batch.size()), batch_model ? batch_matrix.data() : nullptr);
+            batch.clear();
+            return;
+        }
         ffp_program(); // POCKET_GPU_SKIN_V13: fixed-function draw follows
         pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
         Cost submit_cost(profile.submit, (profile.draws & 63) == 0, 64);
@@ -746,6 +820,14 @@ private:
         batch.clear();
     }
     void screen_quad(GLuint image, float u, float top, float bottom) {
+        if (plain_active() && plain_enabled) { // POCKET_GPU_SKIN_V13I: replace, colour alpha 1
+            glBindTexture(GL_TEXTURE_2D, image);
+            const GVertex q[4] = {{{-1, 1, 0, 1}, {1, 1, 1, 1}, {0, top}}, {{-1, -1, 0, 1}, {1, 1, 1, 1}, {0, bottom}},
+                                  {{1, 1, 0, 1}, {1, 1, 1, 1}, {u, top}}, {{1, -1, 0, 1}, {1, 1, 1, 1}, {u, bottom}}};
+            frag_tex[0] = 1; frag_tex[1] = 3; frag_tex[2] = 0; frag_tex[3] = 1; frag_alpha[0] = 0;
+            plain_draw(GL_TRIANGLE_STRIP, q, 4, nullptr);
+            return;
+        }
         ffp_program(); // POCKET_GPU_SKIN_V13
         glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, image);
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
