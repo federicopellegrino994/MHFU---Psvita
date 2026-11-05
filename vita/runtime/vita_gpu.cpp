@@ -258,8 +258,10 @@ class VitaGpu final : public gpu::Backend {
         if (bound_program == 0) glUseProgram(skin_program);
         static const GLfloat skin_mode[4] = {0, 0, 0, 0};
         glUniform4fv(u_mode, 1, skin_mode);
-        for (GLuint i = 0; i < 5; ++i) glEnableVertexAttribArray(i);
-        glDisableVertexAttribArray(5); glDisableVertexAttribArray(6);
+        // POCKET_GPU_SKIN_V13M: all 7 attributes stay enabled with pointers into the current vertex buffer.
+        // vitaGL decides "packed" layout and offsets from the first attributes even when they are disabled, so a
+        // disabled attribute with a stale pointer can make it read the wrong memory.
+        for (GLuint i = 0; i < 7; ++i) glEnableVertexAttribArray(i);
         bound_program = 1; skin_bound = true;
     }
     void use_plain_program() {
@@ -267,9 +269,7 @@ class VitaGpu final : public gpu::Backend {
         if (bound_program == 0) glUseProgram(skin_program);
         static const GLfloat plain_mode[4] = {1, 0, 0, 0};
         glUniform4fv(u_mode, 1, plain_mode);
-        glEnableVertexAttribArray(2); glEnableVertexAttribArray(5); glEnableVertexAttribArray(6);
-        glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
-        glDisableVertexAttribArray(3); glDisableVertexAttribArray(4);
+        for (GLuint i = 0; i < 7; ++i) glEnableVertexAttribArray(i); // POCKET_GPU_SKIN_V13M
         skin_xform_gen = ~0ull; // uMvp is shared: the next skinned draw uploads its own again
         bound_program = 2; skin_bound = false;
     }
@@ -286,6 +286,13 @@ class VitaGpu final : public gpu::Backend {
         }
         glUniform4fv(u_tex, 1, tex); glUniform4fv(u_env, 1, frag_env); glUniform4fv(u_alpha, 1, frag_alpha);
         constexpr GLsizei stride = sizeof(GVertex);
+        // POCKET_GPU_SKIN_V13M: the skin attributes (unused in plain mode) read harmless bytes of the same vertices;
+        // aW0 is at the lowest address, as vitaGL's packed layout expects of the first attribute.
+        const auto *vb = reinterpret_cast<const std::uint8_t *>(v);
+        glVertexAttribPointer(0, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, vb + 0);
+        glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, vb + 4);
+        glVertexAttribPointer(3, 3, GL_BYTE, GL_FALSE, stride, vb + 8);
+        glVertexAttribPointer(4, 3, GL_SHORT, GL_FALSE, stride, vb + 12);
         glVertexAttribPointer(6, 4, GL_FLOAT, GL_FALSE, stride, v[0].position);
         glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, v[0].color);
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, v[0].uv);
@@ -304,7 +311,7 @@ class VitaGpu final : public gpu::Backend {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &white);
         plain_program = skin_program;
         state_valid = false; prepared = false; // rebind the real texture state at the next draw
-        std::fprintf(stderr, "[gpu-plain] v13l ready: one custom program for every draw (no program switches)\n");
+        std::fprintf(stderr, "[gpu-plain] v13m ready: one custom program for every draw (no program switches)\n");
         std::fflush(stderr);
         return true;
     }
@@ -363,7 +370,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(0); bound_program = 0;
         // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
         if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
-        std::fprintf(stderr, "[gpu-skin] v13l program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v13m program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -487,6 +494,8 @@ public:
         glVertexAttribPointer(2, 2, GL_UNSIGNED_SHORT, GL_FALSE, stride, base + 8);
         glVertexAttribPointer(3, 3, GL_BYTE, GL_FALSE, stride, base + 12);
         glVertexAttribPointer(4, 3, GL_SHORT, GL_FALSE, stride, base + 16);
+        glVertexAttribPointer(5, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 0); // POCKET_GPU_SKIN_V13M: unused here
+        glVertexAttribPointer(6, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 4);
         const GLenum mode = type == 3 ? GL_TRIANGLES : type == 4 ? GL_TRIANGLE_STRIP : GL_TRIANGLE_FAN;
         {
             pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
