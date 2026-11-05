@@ -185,7 +185,7 @@ class VitaGpu final : public gpu::Backend {
     // fails the path stays off and the CPU path draws everything, as before.
     bool skin_enabled = false, skin_tried = false, skin_ready = false, skin_bound = false;
     GLuint skin_program = 0;
-    GLint u_bones = -1, u_world = -1, u_mvp = -1, u_uvt = -1, u_lpos = -1, u_ldir = -1, u_latt = -1,
+    GLint u_bones = -1, u_world = -1, u_mvp = -1, u_uv = -1, u_uvt = -1, u_lpos = -1, u_ldir = -1, u_latt = -1,
           u_lspot = -1, u_lamb = -1, u_ldif = -1, u_lspe = -1, u_mamb = -1, u_mdif = -1, u_mspe = -1, u_base = -1,
           u_params = -1, u_near = -1, u_tex = -1, u_env = -1, u_alpha = -1, u_sampler = -1;
     pocket::skin::Uniforms skin_u;
@@ -244,18 +244,19 @@ class VitaGpu final : public gpu::Backend {
     // v13i used two programs; switching between them left the plain draws washed out (village under a white
     // veil while the characters were right, and fine with the skin off). Now nothing is ever switched.
     int bound_program = 0;          // 0 fixed function, 1 the program in skin mode, 2 the program in plain mode
-    // POCKET_GPU_BATCH_V16: pending skinned draws (see draw_skinned)
-    static constexpr unsigned kSkinSlots = 8;
+    // POCKET_GPU_BATCH_V16B: pending skinned draws (see draw_skinned). v16 gave every draw its own bone slot in a
+    // big uniform array; on the Vita that shader broke every draw. Now only draws with the SAME bones are joined
+    // (the game uploads bones once for ~7 pieces of a model), with the unchanged v15 shader.
     bool skin_batching = true;      // no-skin-batch.flag: one GL draw per PSP draw (v15)
     std::vector<pocket::skin::Vertex> sb_vertices; std::vector<std::uint16_t> sb_indices;
-    GLfloat sb_bones[kSkinSlots * 24][4]{}, sb_uvs[kSkinSlots][4]{}, sb_uvt[4]{}, sb_tex[4]{}, sb_env[4]{}, sb_alpha[4]{};
+    GLfloat sb_bones[24][4]{}, sb_uv[4]{}, sb_uvt[4]{}, sb_tex[4]{}, sb_env[4]{}, sb_alpha[4]{};
+    std::uint64_t sb_bone_gen = ~0ull; unsigned sb_weights = ~0u;
     unsigned sb_slots = 0, skin_gl_draws = 0;
-    GLint u_uvs = -1;
     void flush_skin() {
         if (!sb_slots) return;
         use_skin_program();
-        glUniform4fv(u_bones, GLsizei(sb_slots * 24), &sb_bones[0][0]);
-        glUniform4fv(u_uvs, GLsizei(sb_slots), &sb_uvs[0][0]);
+        glUniform4fv(u_bones, 24, &sb_bones[0][0]);
+        glUniform4fv(u_uv, 1, sb_uv);
         glUniform4fv(u_uvt, 1, sb_uvt);
         glUniform4fv(u_tex, 1, sb_tex); glUniform4fv(u_env, 1, sb_env); glUniform4fv(u_alpha, 1, sb_alpha);
         const auto *base = reinterpret_cast<const std::uint8_t *>(sb_vertices.data());
@@ -263,7 +264,7 @@ class VitaGpu final : public gpu::Backend {
         glVertexAttribPointer(0, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 0);
         glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 4);
         glVertexAttribPointer(2, 2, GL_UNSIGNED_SHORT, GL_FALSE, stride, base + 8);
-        glVertexAttribPointer(3, 4, GL_BYTE, GL_FALSE, stride, base + 12);   // normal + slot
+        glVertexAttribPointer(3, 3, GL_BYTE, GL_FALSE, stride, base + 12);
         glVertexAttribPointer(4, 3, GL_SHORT, GL_FALSE, stride, base + 16);
         glVertexAttribPointer(5, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 0); // unused in skin mode
         glVertexAttribPointer(6, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 4);
@@ -347,12 +348,12 @@ class VitaGpu final : public gpu::Backend {
         // (most of the quest terrain) can stay on the GPU. Rebuild the transform so the cache sees the change.
         if (FILE *sf = std::fopen("ux0:data/pocketprobe/no-pmo-split.flag", "rb")) { std::fclose(sf); pmo_split = false; }
         if (FILE *bf = std::fopen("ux0:data/pocketprobe/no-skin-batch.flag", "rb")) { std::fclose(bf); skin_batching = false; }
-        std::fprintf(stderr, "[skin-batch] v16 %s\n", skin_batching ? "on: up to 8 skinned draws per GL draw" : "off (no-skin-batch.flag)");
+        std::fprintf(stderr, "[skin-batch] v16 %s\n", skin_batching ? "on (v16b): skinned draws sharing the same bones and state go in one GL draw" : "off (no-skin-batch.flag)");
         std::fprintf(stderr, "[pmo-split] v15 %s\n", pmo_split ? "on: PMO groups crossing the near plane are split per triangle" : "off (no-pmo-split.flag)");
         if (FILE *nf = std::fopen("ux0:data/pocketprobe/no-depth-free.flag", "rb")) std::fclose(nf);
         else { rigid_transform.depth_check = false; rigid_transform_valid = false; }
         std::fprintf(stderr, "[gpu-batch] v14 depth range check %s\n", rigid_transform.depth_check ? "kept (no-depth-free.flag)" : "off: shader clamps depth like the PSP");
-        std::fprintf(stderr, "[gpu-plain] v16 ready: one custom program for every draw (no program switches)\n");
+        std::fprintf(stderr, "[gpu-plain] v16b ready: one custom program for every draw (no program switches)\n");
         std::fflush(stderr);
         return true;
     }
@@ -400,18 +401,18 @@ class VitaGpu final : public gpu::Backend {
             if (l < 0) std::fprintf(stderr, "[gpu-skin] uniform %s not found\n", name);
             return l;
         };
-        u_bones = loc("uBones"); u_world = loc("uWorld"); u_mvp = loc("uMvp"); u_uvs = loc("uUvs"); u_uvt = loc("uUvt");
+        u_bones = loc("uBones"); u_world = loc("uWorld"); u_mvp = loc("uMvp"); u_uv = loc("uUv"); u_uvt = loc("uUvt");
         u_lpos = loc("uLpos"); u_ldir = loc("uLdir"); u_latt = loc("uLatt"); u_lspot = loc("uLspot");
         u_lamb = loc("uLamb"); u_ldif = loc("uLdif"); u_lspe = loc("uLspe");
         u_mamb = loc("uMamb"); u_mdif = loc("uMdif"); u_mspe = loc("uMspe"); u_base = loc("uBase"); u_params = loc("uParams"); u_near = loc("uNear"); u_mode = loc("uMode");
         u_tex = loc("uTex"); u_env = loc("uEnv"); u_alpha = loc("uAlpha"); u_sampler = loc("uTexture");
-        if (u_bones < 0 || u_mvp < 0 || u_params < 0 || u_near < 0 || u_uvs < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); std::fflush(stderr); return false; }
+        if (u_bones < 0 || u_mvp < 0 || u_params < 0 || u_near < 0 || u_uv < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); std::fflush(stderr); return false; }
         glUseProgram(skin_program);
         if (u_sampler >= 0) glUniform1i(u_sampler, 0);
         glUseProgram(0); bound_program = 0;
         // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
         if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
-        std::fprintf(stderr, "[gpu-skin] v16 program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v16b program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -482,7 +483,8 @@ public:
         const unsigned at = ge.reg(0xdb);
         const GLfloat alpha[4] = {(ge.reg(0x22) & 1u) ? 1.0f : 0.0f, float(at & 7u), float((at >> 8) & 255u) / 255, 0};
         const unsigned tri_indices = type == 3 ? count : (count - 2) * 3;
-        if (sb_slots && (sb_slots >= kSkinSlots || !skin_batching || generation != skin_xform_gen ||
+        if (sb_slots && (!skin_batching || generation != skin_xform_gen || ge.bone_generation() != sb_bone_gen ||
+                         f.weights != sb_weights || std::memcmp(sb_uv, skin_u.uv, sizeof sb_uv) != 0 ||
                          ge.light_generation() != skin_light_gen || sb_vertices.size() + span > 65535u ||
                          std::memcmp(sb_uvt, skin_u.uvt, sizeof sb_uvt) != 0 || std::memcmp(sb_tex, tex, sizeof tex) != 0 ||
                          std::memcmp(sb_env, envc, sizeof envc) != 0 || std::memcmp(sb_alpha, alpha, sizeof alpha) != 0))
@@ -504,19 +506,18 @@ public:
             glUniform4fv(u_base, 1, skin_u.base); glUniform4fv(u_params, 1, skin_u.params);
             skin_light_gen = ge.light_generation();
         }
+        pocket::skin::fill_bones(ge, f.weights, skin_u); // the self-check uses them too
         if (sb_slots == 0) {
             std::memcpy(sb_uvt, skin_u.uvt, sizeof sb_uvt); std::memcpy(sb_tex, tex, sizeof tex);
             std::memcpy(sb_env, envc, sizeof envc); std::memcpy(sb_alpha, alpha, sizeof alpha);
+            std::memcpy(&sb_bones[0][0], &skin_u.bones[0][0], sizeof sb_bones); std::memcpy(sb_uv, skin_u.uv, sizeof sb_uv);
+            sb_bone_gen = ge.bone_generation(); sb_weights = f.weights;
         }
-        const unsigned slot = sb_slots++;
-        pocket::skin::fill_bones(ge, f.weights, skin_u);
-        std::memcpy(&sb_bones[slot * 24][0], &skin_u.bones[0][0], sizeof skin_u.bones);
-        std::memcpy(sb_uvs[slot], skin_u.uv, sizeof skin_u.uv);
+        ++sb_slots;
         const unsigned first = static_cast<unsigned>(sb_vertices.size());
         sb_vertices.resize(first + span);
         for (unsigned i = 0; i < span; ++i) {
             pocket::skin::repack(src + i * f.stride, f, sb_vertices[first + i]);
-            sb_vertices[first + i].n[3] = static_cast<std::int8_t>(slot);
         }
         const auto at_index = [&](unsigned i) -> std::uint16_t {
             unsigned v = i;

@@ -295,10 +295,10 @@ inline Out run_vertex(const Uniforms &u, const Vertex &v) {
 inline constexpr const char *kVertexShader = R"(
 float spow(float x, float y) { return x > 0.0 ? pow(x, y) : (y == 0.0 ? 1.0 : 0.0); }
 void main(
-    float4 aW0, float4 aW1, float2 aUV, float4 aN, float3 aP, float4 aColor, float4 aPos,
+    float4 aW0, float4 aW1, float2 aUV, float3 aN, float3 aP, float4 aColor, float4 aPos,
     uniform float4 uMode,
-    uniform float4 uBones[192], uniform float4 uWorld[3], uniform float4 uMvp[4],
-    uniform float4 uUvs[8], uniform float4 uUvt,
+    uniform float4 uBones[24], uniform float4 uWorld[3], uniform float4 uMvp[4],
+    uniform float4 uUv, uniform float4 uUvt,
     uniform float4 uLpos[4], uniform float4 uLdir[4], uniform float4 uLatt[4], uniform float4 uLspot[4],
     uniform float4 uLamb[4], uniform float4 uLdif[4], uniform float4 uLspe[4],
     uniform float4 uMamb, uniform float4 uMdif, uniform float4 uMspe, uniform float4 uBase, uniform float4 uParams,
@@ -315,27 +315,23 @@ void main(
     vColor = aColor;
     vTexcoord = aUV;
   } else {
-    // POCKET_GPU_BATCH_V16: up to 8 PSP draws in one GL draw; aN.w is the draw's slot (bones and UV scale).
-    int slot = int(aN.w + 0.5);
-    int b0 = slot * 24;
     float4 w0 = aW0 * (1.0 / 128.0);
     float4 w1 = aW1 * (1.0 / 128.0);
-    float4 R0 = uBones[b0 + 0] * w0.x + uBones[b0 + 3] * w0.y + uBones[b0 + 6] * w0.z + uBones[b0 + 9] * w0.w
-              + uBones[b0 + 12] * w1.x + uBones[b0 + 15] * w1.y + uBones[b0 + 18] * w1.z + uBones[b0 + 21] * w1.w;
-    float4 R1 = uBones[b0 + 1] * w0.x + uBones[b0 + 4] * w0.y + uBones[b0 + 7] * w0.z + uBones[b0 + 10] * w0.w
-              + uBones[b0 + 13] * w1.x + uBones[b0 + 16] * w1.y + uBones[b0 + 19] * w1.z + uBones[b0 + 22] * w1.w;
-    float4 R2 = uBones[b0 + 2] * w0.x + uBones[b0 + 5] * w0.y + uBones[b0 + 8] * w0.z + uBones[b0 + 11] * w0.w
-              + uBones[b0 + 14] * w1.x + uBones[b0 + 17] * w1.y + uBones[b0 + 20] * w1.z + uBones[b0 + 23] * w1.w;
+    float4 R0 = uBones[0] * w0.x + uBones[3] * w0.y + uBones[6] * w0.z + uBones[9] * w0.w
+              + uBones[12] * w1.x + uBones[15] * w1.y + uBones[18] * w1.z + uBones[21] * w1.w;
+    float4 R1 = uBones[1] * w0.x + uBones[4] * w0.y + uBones[7] * w0.z + uBones[10] * w0.w
+              + uBones[13] * w1.x + uBones[16] * w1.y + uBones[19] * w1.z + uBones[22] * w1.w;
+    float4 R2 = uBones[2] * w0.x + uBones[5] * w0.y + uBones[8] * w0.z + uBones[11] * w0.w
+              + uBones[14] * w1.x + uBones[17] * w1.y + uBones[20] * w1.z + uBones[23] * w1.w;
     float4 P = float4(aP * (1.0 / 32768.0), 1.0);
-    float3 N = aN.xyz * (1.0 / 128.0);
+    float3 N = aN * (1.0 / 128.0);
     float4 m = float4(dot(R0, P), dot(R1, P), dot(R2, P), 1.0);
     float3 nm = float3(dot(R0.xyz, N), dot(R1.xyz, N), dot(R2.xyz, N));
     float4 g = uMvp[0] * m.x + uMvp[1] * m.y + uMvp[2] * m.z + uMvp[3];
     float nd = dot(uNear, m);
     g.z = nd < 0.0 ? -2.0 * abs(g.w) : min(max(g.z, -g.w), g.w);
     vPosition = g;
-    float4 uvs = uUvs[slot];
-    float2 t = aUV * (1.0 / 32768.0) * uvs.xy + uvs.zw;
+    float2 t = aUV * (1.0 / 32768.0) * uUv.xy + uUv.zw;
     vTexcoord = float2(t.x * uUvt.x, t.y * uUvt.y + uUvt.z);
 
     float4 c = uBase;
