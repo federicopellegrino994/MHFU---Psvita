@@ -354,7 +354,7 @@ void Ge::execute(std::uint32_t word, std::uint32_t) {
     if (const std::uint8_t f = kCmdFlags[cmd]) {
         if (f & kFXform) xform_dirty_ = true;
         if (f & kFViewport) viewport_dirty_ = true;
-        if (f & kFLight) light_dirty_ = true;
+        if (f & kFLight) { light_dirty_ = true; ++light_generation_; }
         if (f & kFRigid) ++rigid_transform_generation_;
         if (f & kFTexture) ++texture_cache_generation_;
     }
@@ -374,6 +374,7 @@ void Ge::execute(std::uint32_t word, std::uint32_t) {
     case kBoneMatrixData:
         if (bone_i_ < 96) {
             bones_[bone_i_ / 12].m[bone_i_ % 12] = float24(data);
+            ++bone_generation_; // POCKET_GPU_SKIN_V13
             ++bone_i_;
         }
         return;
@@ -479,6 +480,11 @@ Layout layout_for(std::uint32_t vt) {
     return l;
 }
 } // namespace
+
+Ge::VertexOffsets Ge::vertex_offsets(std::uint32_t vt) {
+    const Layout l = layout_for(vt);
+    return {l.weight_offset, l.tc_offset, l.color_offset, l.normal_offset, l.pos_offset, l.size};
+}
 
 std::uint32_t Ge::vertex_size() const {
     const std::uint32_t vt = regs_[kVertexType];
@@ -958,6 +964,8 @@ void Ge::draw_primitive(std::uint32_t data) {
     if (backend_ != nullptr) {
         pocket::phase::GeScope rigid_phase(pocket::phase::GeRigid);
         rigid_handled = backend_->draw_rigid(*this, type, count, vaddr, iaddr);
+        // POCKET_GPU_SKIN_V13: skinned and lit models, transformed and lit by the backend.
+        if (!rigid_handled) rigid_handled = backend_->draw_skinned(*this, type, count, vaddr, iaddr);
     }
     if (rigid_handled) {
         if (index_format) regs_[kIaddr] = iaddr + count * (index_format == 1 ? 1u : 2u);

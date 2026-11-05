@@ -7,6 +7,7 @@
 #include "rigid_visibility_cache.hpp"
 #include "pocket_pixel.hpp"
 #include "pocket_phase_probe.hpp" // POCKET_PHASE_PROBE_V9
+#include "skin_gpu.hpp"       // POCKET_GPU_SKIN_V13
 #include <vitaGL.h>
 #include <psp2/kernel/processmgr.h>
 #include <algorithm>
@@ -170,7 +171,179 @@ class VitaGpu final : public gpu::Backend {
         glDeleteTextures(1, &i->second.color);
         targets.erase(i);
     }
+    // POCKET_GPU_SKIN_V13: skinning + PSP lighting in a vertex shader for the formats pocket::skin::format_for() takes.
+    // Enabled with ux0:data/pocketprobe/gpu-skin.flag. The program is compiled the first time it is needed; if that
+    // fails the path stays off and the CPU path draws everything, as before.
+    bool skin_enabled = false, skin_tried = false, skin_ready = false, skin_bound = false;
+    GLuint skin_program = 0;
+    GLint u_bones = -1, u_world = -1, u_mvp = -1, u_uv = -1, u_uvt = -1, u_lpos = -1, u_ldir = -1, u_latt = -1,
+          u_lspot = -1, u_lamb = -1, u_ldif = -1, u_lspe = -1, u_mamb = -1, u_mdif = -1, u_mspe = -1, u_base = -1,
+          u_params = -1, u_tex = -1, u_env = -1, u_alpha = -1, u_sampler = -1;
+    pocket::skin::Uniforms skin_u;
+    std::uint64_t skin_bone_gen = ~0ull, skin_light_gen = ~0ull, skin_xform_gen = ~0ull;
+    unsigned skin_bone_count = ~0u;
+    std::vector<pocket::skin::Vertex> skin_vertices;
+    std::vector<std::uint16_t> skin_indices;
+    struct { unsigned draws{}, vertices{}, format{}, prim{}, texgen{}, clear{}, memory{}, transform{}, range{}; } skin_profile;
+    void ffp_program() { // back to vitaGL's fixed-function pipeline before any non-skinned draw
+        if (!skin_bound) return;
+        glUseProgram(0);
+        for (GLuint i = 0; i < 5; ++i) glDisableVertexAttribArray(i);
+        skin_bound = false;
+    }
+    static GLuint skin_shader(GLenum type, const char *source, const char *what) {
+        const GLuint s = glCreateShader(type);
+        glShaderSource(s, 1, &source, nullptr);
+        glCompileShader(s);
+        GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char log[1024] = {}; GLsizei n = 0; glGetShaderInfoLog(s, sizeof log - 1, &n, log);
+            std::fprintf(stderr, "[gpu-skin] %s shader compile FAILED: %s\n", what, log);
+            glDeleteShader(s); return 0;
+        }
+        return s;
+    }
+    bool skin_setup() {
+        if (skin_tried) return skin_ready;
+        skin_tried = true;
+        const GLuint vs = skin_shader(GL_VERTEX_SHADER, pocket::skin::kVertexShader, "vertex");
+        const GLuint fs = skin_shader(GL_FRAGMENT_SHADER, pocket::skin::kFragmentShader, "fragment");
+        if (!vs || !fs) { std::fprintf(stderr, "[gpu-skin] disabled: CPU path keeps drawing these models\n"); return false; }
+        skin_program = glCreateProgram();
+        glAttachShader(skin_program, vs); glAttachShader(skin_program, fs);
+        glBindAttribLocation(skin_program, 0, "aW0"); glBindAttribLocation(skin_program, 1, "aW1");
+        glBindAttribLocation(skin_program, 2, "aUV"); glBindAttribLocation(skin_program, 3, "aN");
+        glBindAttribLocation(skin_program, 4, "aP");
+        glLinkProgram(skin_program);
+        GLint ok = 0; glGetProgramiv(skin_program, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[1024] = {}; GLsizei n = 0; glGetProgramInfoLog(skin_program, sizeof log - 1, &n, log);
+            std::fprintf(stderr, "[gpu-skin] link FAILED: %s; disabled\n", log); return false;
+        }
+        auto loc = [&](const char *name) {
+            GLint l = glGetUniformLocation(skin_program, name);
+            if (l < 0) { char indexed[64]; std::snprintf(indexed, sizeof indexed, "%s[0]", name); l = glGetUniformLocation(skin_program, indexed); }
+            if (l < 0) std::fprintf(stderr, "[gpu-skin] uniform %s not found\n", name);
+            return l;
+        };
+        u_bones = loc("uBones"); u_world = loc("uWorld"); u_mvp = loc("uMvp"); u_uv = loc("uUv"); u_uvt = loc("uUvt");
+        u_lpos = loc("uLpos"); u_ldir = loc("uLdir"); u_latt = loc("uLatt"); u_lspot = loc("uLspot");
+        u_lamb = loc("uLamb"); u_ldif = loc("uLdif"); u_lspe = loc("uLspe");
+        u_mamb = loc("uMamb"); u_mdif = loc("uMdif"); u_mspe = loc("uMspe"); u_base = loc("uBase"); u_params = loc("uParams");
+        u_tex = loc("uTex"); u_env = loc("uEnv"); u_alpha = loc("uAlpha"); u_sampler = loc("uTexture");
+        if (u_bones < 0 || u_mvp < 0 || u_params < 0 || u_tex < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); return false; }
+        glUseProgram(skin_program);
+        if (u_sampler >= 0) glUniform1i(u_sampler, 0);
+        glUseProgram(0);
+        std::fprintf(stderr, "[gpu-skin] v13 program ready (vertex + fragment compiled and linked)\n");
+        skin_ready = true;
+        return true;
+    }
+public:
+    bool draw_skinned(const Ge &ge, unsigned type, unsigned count, unsigned vaddr, unsigned iaddr) override {
+        if (!skin_enabled) return false;
+        if (type < 3 || type > 5 || count < 3 || count > 65535) { ++skin_profile.prim; return false; }
+        pocket::skin::Format f;
+        if (!pocket::skin::format_for(ge.reg(0x12), f)) { ++skin_profile.format; return false; }
+        if (ge.reg(0xc0) & 3u) { ++skin_profile.texgen; return false; }
+        if (ge.reg(0xd3) & 1u) { ++skin_profile.clear; return false; }
+        if (!skin_setup()) { skin_enabled = false; return false; }
+        // Same transform cache as the rigid paths: model -> GL clip including the PSP viewport and screen offset.
+        const auto generation = ge.rigid_transform_generation();
+        if (!rigid_transform_valid || generation != rigid_generation) {
+            pocket::rigid::Parameters parameters;
+            parameters.world = ge.world_matrix().m; parameters.view = ge.view_matrix().m; parameters.projection = ge.proj_matrix().m;
+            parameters.viewport = {gpu::float24(ge.reg(0x42)), gpu::float24(ge.reg(0x43)), gpu::float24(ge.reg(0x44)),
+                gpu::float24(ge.reg(0x45)), gpu::float24(ge.reg(0x46)), gpu::float24(ge.reg(0x47)),
+                float(ge.reg(0x4c) & 65535) / 16, float(ge.reg(0x4d) & 65535) / 16};
+            rigid_transform_valid = rigid_transform.build(parameters); rigid_generation = generation;
+            if (rigid_transform_valid) visibility_cache.set_transform(rigid_transform);
+        }
+        if (!rigid_transform_valid) { ++skin_profile.transform; return false; }
+        // Indices and the vertex range they use, read before any GL state changes.
+        const std::uint8_t *ib = f.index ? ge.guest_bytes(iaddr, count * f.index) : nullptr;
+        if (f.index && !ib) { ++skin_profile.memory; return false; }
+        unsigned lo = 0, hi = count - 1;
+        if (f.index) {
+            lo = 0xFFFFu; hi = 0;
+            for (unsigned i = 0; i < count; ++i) {
+                unsigned v;
+                if (f.index == 1) v = ib[i]; else { std::uint16_t s; std::memcpy(&s, ib + i * 2u, 2); v = s; }
+                lo = std::min(lo, v); hi = std::max(hi, v);
+            }
+        }
+        const unsigned span = hi - lo + 1u;
+        if (span > 65535u) { ++skin_profile.range; return false; }
+        const std::uint8_t *src = ge.guest_bytes(vaddr + lo * f.stride, span * f.stride);
+        if (!src) { ++skin_profile.memory; return false; }
+        if (skin_vertices.size() < span) skin_vertices.resize(span);
+        for (unsigned i = 0; i < span; ++i) pocket::skin::repack(src + i * f.stride, f, skin_vertices[i]);
+        if (f.index) {
+            skin_indices.resize(count);
+            for (unsigned i = 0; i < count; ++i) {
+                unsigned v;
+                if (f.index == 1) v = ib[i]; else { std::uint16_t s; std::memcpy(&s, ib + i * 2u, 2); v = s; }
+                skin_indices[i] = static_cast<std::uint16_t>(v - lo);
+            }
+        }
+        // GL state exactly as for the CPU path (depth, blend, scissor, target, texture binding and filtering).
+        draw_batch();
+        prepared = false; ++serial; prepare(ge);
+        if (!skin_bound) {
+            glUseProgram(skin_program);
+            for (GLuint i = 0; i < 5; ++i) glEnableVertexAttribArray(i);
+            skin_bound = true; // uniform values stay with the program (GL semantics), no re-upload needed
+        }
+        if (ge.bone_generation() != skin_bone_gen || f.weights != skin_bone_count) {
+            pocket::skin::fill_bones(ge, f.weights, skin_u);
+            glUniform4fv(u_bones, 24, &skin_u.bones[0][0]);
+            skin_bone_gen = ge.bone_generation(); skin_bone_count = f.weights;
+        }
+        if (generation != skin_xform_gen) {
+            pocket::skin::fill_transform(ge, rigid_transform, skin_u);
+            glUniform4fv(u_world, 3, &skin_u.world[0][0]); glUniform4fv(u_mvp, 4, &skin_u.mvp[0][0]);
+            skin_xform_gen = generation;
+        }
+        if (ge.light_generation() != skin_light_gen) {
+            pocket::skin::fill_light(ge, skin_u);
+            glUniform4fv(u_lpos, 4, &skin_u.lpos[0][0]); glUniform4fv(u_ldir, 4, &skin_u.ldir[0][0]);
+            glUniform4fv(u_latt, 4, &skin_u.latt[0][0]); glUniform4fv(u_lspot, 4, &skin_u.lspot[0][0]);
+            glUniform4fv(u_lamb, 4, &skin_u.lamb[0][0]); glUniform4fv(u_ldif, 4, &skin_u.ldif[0][0]);
+            glUniform4fv(u_lspe, 4, &skin_u.lspe[0][0]);
+            glUniform4fv(u_mamb, 1, skin_u.mamb); glUniform4fv(u_mdif, 1, skin_u.mdif); glUniform4fv(u_mspe, 1, skin_u.mspe);
+            glUniform4fv(u_base, 1, skin_u.base); glUniform4fv(u_params, 1, skin_u.params);
+            skin_light_gen = ge.light_generation();
+        }
+        pocket::skin::fill_uv(ge, target_texture, float(texture_width), float(texture_height), float(Side), skin_u);
+        glUniform4fv(u_uv, 1, skin_u.uv); glUniform4fv(u_uvt, 1, skin_u.uvt);
+        const bool textured = (ge.reg(0x1e) & 1u) != 0;
+        const unsigned func = ge.reg(0xc9);
+        const GLfloat tex[4] = {textured ? 1.0f : 0.0f, float(std::min(4u, func & 7u)), (func & 0x100u) ? 1.0f : 0.0f,
+                                (func & 0x10000u) ? 2.0f : 1.0f};
+        const unsigned env = ge.reg(0xca);
+        const GLfloat envc[4] = {float(env & 255) / 255, float((env >> 8) & 255) / 255, float((env >> 16) & 255) / 255, 1};
+        const unsigned at = ge.reg(0xdb);
+        const GLfloat alpha[4] = {(ge.reg(0x22) & 1u) ? 1.0f : 0.0f, float(at & 7u), float((at >> 8) & 255u) / 255, 0};
+        glUniform4fv(u_tex, 1, tex); glUniform4fv(u_env, 1, envc); glUniform4fv(u_alpha, 1, alpha);
+        const auto *base = reinterpret_cast<const std::uint8_t *>(skin_vertices.data());
+        constexpr GLsizei stride = sizeof(pocket::skin::Vertex);
+        glVertexAttribPointer(0, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 0);
+        glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, base + 4);
+        glVertexAttribPointer(2, 2, GL_UNSIGNED_SHORT, GL_FALSE, stride, base + 8);
+        glVertexAttribPointer(3, 3, GL_BYTE, GL_FALSE, stride, base + 12);
+        glVertexAttribPointer(4, 3, GL_SHORT, GL_FALSE, stride, base + 16);
+        const GLenum mode = type == 3 ? GL_TRIANGLES : type == 4 ? GL_TRIANGLE_STRIP : GL_TRIANGLE_FAN;
+        {
+            pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
+            if (f.index) glDrawElements(mode, GLsizei(count), GL_UNSIGNED_SHORT, skin_indices.data());
+            else glDrawArrays(mode, 0, GLsizei(count));
+        }
+        ++skin_profile.draws; skin_profile.vertices += span;
+        return true;
+    }
+private:
     void plain_state() {
+        ffp_program();
         glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
         glDisable(GL_ALPHA_TEST); glDisable(GL_CULL_FACE); glDisable(GL_LIGHTING);
         glDisable(GL_FOG); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -429,6 +602,7 @@ class VitaGpu final : public gpu::Backend {
     }
     void draw_batch() {
         if (batch.empty()) return;
+        ffp_program(); // POCKET_GPU_SKIN_V13: fixed-function draw follows
         pocket::phase::GeScope submit_phase(pocket::phase::GeSubmit);
         Cost submit_cost(profile.submit, (profile.draws & 63) == 0, 64);
         ++profile.draws;
@@ -451,6 +625,7 @@ class VitaGpu final : public gpu::Backend {
         batch.clear();
     }
     void screen_quad(GLuint image, float u, float top, float bottom) {
+        ffp_program(); // POCKET_GPU_SKIN_V13
         glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, image);
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
         glColor4f(1, 1, 1, 1);
@@ -494,6 +669,9 @@ public:
         if(FILE*f=std::fopen("ux0:data/pocketprobe/no-pmo-group-gpu.flag","rb")){std::fclose(f);pmo_group_gpu=false;}
         std::fprintf(stderr,"[pmo-native] live-v1 %s; GPU groups %s; original command stream + whole-group decode\n",
             pocket::pmo::live_enabled()?"enabled":"disabled by flag",pmo_group_gpu?"enabled":"disabled by flag");
+        if (FILE *f = std::fopen("ux0:data/pocketprobe/gpu-skin.flag", "rb")) { std::fclose(f); skin_enabled = true; }
+        std::fprintf(stderr, "[gpu-skin] v13 %s; skinning + PSP lighting in a vertex shader for u8-weight/s16 models\n",
+                     skin_enabled ? "enabled by gpu-skin.flag" : "off (create gpu-skin.flag to try it)");
         rigid_scratch.reserve(256);
         std::fprintf(stderr,"[gpu-rigid] v12 %s; VTYPE 00111A + optional 00091A; GPU matrix transform with conservative CPU clipping checks\n",rigid_enabled?"enabled":"disabled by flag");
         vglWaitVblankStart(GL_FALSE);
@@ -759,6 +937,12 @@ public:
                 profile.upload * per_frame, profile.submit * per_frame, profile.flush * per_frame, profile.swap * per_frame);
             std::fprintf(stderr, "[gpu-count] period: requests=%u hits=%u misses=%u draws=%u triangles=%u reused_states=%u\n",
                 profile.requests, profile.hits, profile.misses, profile.draws, profile.triangles, profile.reused);
+            if (skin_enabled || skin_tried) {
+                std::fprintf(stderr, "[gpu-skin] period: draws=%u vertices=%u rejected: format=%u prim=%u texgen=%u clear=%u memory=%u transform=%u range=%u\n",
+                    skin_profile.draws, skin_profile.vertices, skin_profile.format, skin_profile.prim, skin_profile.texgen,
+                    skin_profile.clear, skin_profile.memory, skin_profile.transform, skin_profile.range);
+                skin_profile = {};
+            }
             std::fprintf(stderr, "[gpu-validation] period: full_checks=%u reuses=%u epochs=%u fast_states=%u\n",
                          profile.hash_checks, profile.hash_reuses, profile.invalidations, profile.fast_states);
             std::fprintf(stderr,"[gpu-rigid] period: attempts=%u draws=%u vertices=%u fallback_state=%u fallback_memory=%u fallback_clip=%u batches=%u matrix_splits=%u\n",
@@ -805,6 +989,9 @@ public:
     }
     bool draw_rigid(const Ge &g,unsigned type,unsigned count,std::uint32_t va,std::uint32_t ia) override {
         bool handled=false;invoke([&]{handled=gpu->draw_rigid(g,type,count,va,ia);});return handled;
+    }
+    bool draw_skinned(const Ge &g,unsigned type,unsigned count,std::uint32_t va,std::uint32_t ia) override { // POCKET_GPU_SKIN_V13
+        bool handled=false;invoke([&]{handled=gpu->draw_skinned(g,type,count,va,ia);});return handled;
     }
     void draw_started(const gpu::DrawInfo &d) override { invoke([&]{ gpu->draw_started(d); }); }
     void triangle(const Ge &g, const Vertex &a, const Vertex &b, const Vertex &c) override {

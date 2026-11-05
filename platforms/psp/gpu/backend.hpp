@@ -40,6 +40,8 @@ public:
     // Return true only after consuming this entire draw. False keeps the
     // reference GE pipeline. Raw guest memory is copied before returning.
     virtual bool draw_rigid(const Ge &, unsigned, unsigned, std::uint32_t, std::uint32_t) { return false; }
+    // POCKET_GPU_SKIN_V13: same contract as draw_rigid, for skinned and/or lit models the backend transforms itself.
+    virtual bool draw_skinned(const Ge &, unsigned, unsigned, std::uint32_t, std::uint32_t) { return false; }
 
     // Screen-space vertices: x, y in framebuffer pixels, z in 0..65535, w = 1/w for perspective correction (1 in
     // through mode), u, v normalized (through mode: texels), colors 0..255, fog 0..1.

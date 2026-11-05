@@ -119,6 +119,12 @@ public:
     [[nodiscard]] const Matrix44 &proj_matrix() const noexcept { return proj_; }
     // Incremented whenever the view or projection matrix, the viewport or the screen offset is written.
     [[nodiscard]] std::uint64_t camera_generation() const noexcept { return camera_generation_; }
+    // POCKET_GPU_SKIN_V13: what a backend needs to skin and light vertices itself.
+    [[nodiscard]] const Matrix43 &bone_matrix(unsigned i) const noexcept { return bones_[i & 7u]; }
+    [[nodiscard]] std::uint64_t bone_generation() const noexcept { return bone_generation_; }   // any bone write
+    [[nodiscard]] std::uint64_t light_generation() const noexcept { return light_generation_; } // lights/material
+    struct VertexOffsets { unsigned weight, tc, color, normal, pos, size; };
+    [[nodiscard]] static VertexOffsets vertex_offsets(std::uint32_t vt); // PSP vertex layout for VTYPE `vt`
 
 private:
     ListResult run_commands(std::uint32_t pc, std::uint32_t stall, const ListEvent &on_event);
@@ -295,6 +301,7 @@ private:
     std::array<std::uint32_t, 256> regs_{};
     Matrix43 world_, view_, texgen_;
     std::array<Matrix43, 8> bones_{};
+    std::uint64_t bone_generation_ = 0, light_generation_ = 0; // POCKET_GPU_SKIN_V13
     Matrix44 proj_;
     unsigned world_i_{}, view_i_{}, proj_i_{}, texgen_i_{}, bone_i_{};
     std::array<float, 8> morph_{1, 0, 0, 0, 0, 0, 0, 0};
