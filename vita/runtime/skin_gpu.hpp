@@ -81,6 +81,7 @@ struct Uniforms {
     float mamb[4]{}, mdif[4]{}, mspe[4]{};          // material colours / 255 (ambient alpha in mamb.w)
     float base[4]{};       // emissive + global ambient * material ambient (lit), or material ambient (unlit), / 255
     float params[4]{};     // x: lighting 0/1, y: normal sign +1/-1, z: separate specular 0/1, w: shininess
+    float near[4]{};       // POCKET_GPU_SKIN_V13D: PSP clip z + w as a function of model space (>= 0 in front of the near plane)
 };
 
 inline void rows(const float m[12], float out[3][4]) {
@@ -103,6 +104,16 @@ inline void fill_transform(const Ge &ge, const pocket::rigid::Transform &t, Unif
     rows(ge.world_matrix().m.data(), u.world);
     for (unsigned c = 0; c < 4; ++c)
         for (unsigned r = 0; r < 4; ++r) { u.mvp[c][r] = t.gpu[c * 4 + r]; u.clip[c][r] = t.clip[c * 4 + r]; }
+    for (unsigned c = 0; c < 4; ++c) u.near[c] = t.clip[c * 4 + 2] + t.clip[c * 4 + 3];
+}
+
+// POCKET_GPU_SKIN_V13D: depth as the CPU path produces it. The PSP clamps screen depth to 0..65535 instead of
+// clipping it (vita_gpu.cpp vertex(): clamp, then *2/65535-1, times w), so GL z is clamped to -w..w; without this the
+// GPU cut away every vertex past the depth range (most of the village). Behind the PSP near plane the vertex is pushed
+// out of the GL depth range so the GPU still clips there (approximately: the CPU path clips exactly on that plane).
+inline void depth_like_psp(float near_distance, float gl[4]) {
+    if (near_distance < 0.0f) gl[2] = -2.0f * std::fabs(gl[3]);
+    else gl[2] = std::min(std::max(gl[2], -gl[3]), gl[3]);
 }
 
 // UV scale/offset (texture map mode 0) and the render-target adjustment vita_gpu.cpp's vertex() applies.
@@ -194,6 +205,7 @@ inline Out run_vertex(const Uniforms &u, const Vertex &v) {
         o.clip[r] = u.clip[0][r] * m[0] + u.clip[1][r] * m[1] + u.clip[2][r] * m[2] + u.clip[3][r];
         o.gl[r] = u.mvp[0][r] * m[0] + u.mvp[1][r] * m[1] + u.mvp[2][r] * m[2] + u.mvp[3][r];
     }
+    depth_like_psp(u.near[0] * m[0] + u.near[1] * m[1] + u.near[2] * m[2] + u.near[3], o.gl);
     const float uu = float(v.uv[0]) * (1.0f / 32768.0f) * u.uv[0] + u.uv[2];
     const float vv = float(v.uv[1]) * (1.0f / 32768.0f) * u.uv[1] + u.uv[3];
     o.uv[0] = uu * u.uvt[0];
@@ -256,6 +268,7 @@ void main(
     uniform float4 uLpos[4], uniform float4 uLdir[4], uniform float4 uLatt[4], uniform float4 uLspot[4],
     uniform float4 uLamb[4], uniform float4 uLdif[4], uniform float4 uLspe[4],
     uniform float4 uMamb, uniform float4 uMdif, uniform float4 uMspe, uniform float4 uBase, uniform float4 uParams,
+    uniform float4 uNear,
     float4 out vPosition : POSITION, float4 out vColor : COLOR, float2 out vTexcoord : TEXCOORD0)
 {
     float4 w0 = aW0 * (1.0 / 128.0);
@@ -270,7 +283,10 @@ void main(
     float3 N = aN * (1.0 / 128.0);
     float4 m = float4(dot(R0, P), dot(R1, P), dot(R2, P), 1.0);
     float3 nm = float3(dot(R0.xyz, N), dot(R1.xyz, N), dot(R2.xyz, N));
-    vPosition = uMvp[0] * m.x + uMvp[1] * m.y + uMvp[2] * m.z + uMvp[3];
+    float4 g = uMvp[0] * m.x + uMvp[1] * m.y + uMvp[2] * m.z + uMvp[3];
+    float nd = dot(uNear, m);
+    g.z = nd < 0.0 ? -2.0 * abs(g.w) : min(max(g.z, -g.w), g.w);
+    vPosition = g;
     float2 t = aUV * (1.0 / 32768.0) * uUv.xy + uUv.zw;
     vTexcoord = float2(t.x * uUvt.x, t.y * uUvt.y + uUvt.z);
 

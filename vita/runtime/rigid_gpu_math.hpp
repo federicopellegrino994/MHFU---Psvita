@@ -51,7 +51,8 @@ struct Transform {
     // POCKET_RIGID_CULL_V9: "outside" means certainly rejected by the
     // existing PSP GE triangle pipeline, not merely outside the Vita display.
     enum class Visibility { Safe, OutsideNear, OutsideGuard, Boundary };
-    Visibility classify(float x,float y,float z)const{
+    // POCKET_GPU_SKIN_V13D: depth=false for the skin path, whose shader clamps depth exactly as the CPU path does.
+    Visibility classify(float x,float y,float z,bool depth=true)const{
         constexpr float eps=128.0f*std::numeric_limits<float>::epsilon();
         const float p[4]={x,y,z,1};float c[4]{},e[4]{};
         for(unsigned i=0;i<4;++i){
@@ -76,7 +77,7 @@ struct Transform {
         if(gx<0||gy<0)return Visibility::OutsideGuard;
         // Depth outside this range is CLAMPED by the reference backend. It
         // must use fallback, never be treated as invisible by this prototype.
-        if(gx!=1||gy!=1||coordinate(2,viewport[2],viewport[5],65535.0f)!=1)
+        if(gx!=1||gy!=1||(depth&&coordinate(2,viewport[2],viewport[5],65535.0f)!=1))
             return Visibility::Boundary;
         return Visibility::Safe;
     }
