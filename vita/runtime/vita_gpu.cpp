@@ -238,82 +238,73 @@ class VitaGpu final : public gpu::Backend {
         }
         glEnd();
     } // POCKET_GPU_SKIN_V13D: models without weights also take the GPU path (skin-weighted-only.flag: no)
-    // POCKET_GPU_SKIN_V13I: which program vitaGL has: 0 fixed function, 1 skin, 2 plain.
-    int bound_program = 0;
-    bool plain_enabled = true;      // no-plain-shader.flag: keep the fixed-function batches (v13h behaviour)
+    // POCKET_GPU_SKIN_V13L: one custom program for skinned models AND every other draw (uMode selects).
+    // v13i used two programs; switching between them left the plain draws washed out (village under a white
+    // veil while the characters were right, and fine with the skin off). Now nothing is ever switched.
+    int bound_program = 0;          // 0 fixed function, 1 the program in skin mode, 2 the program in plain mode
+    bool plain_enabled = true;      // no-plain-shader.flag: fixed-function batches (v13h behaviour)
     GLuint plain_program = 0, white_texture = 0;
-    GLint p_mat = -1, p_tex = -1, p_env = -1, p_alpha = -1, p_sampler = -1;
+    GLint u_mode = -1;
     GLfloat frag_tex[4] = {0, 0, 0, 1}, frag_env[4] = {0, 0, 0, 1}, frag_alpha[4] = {0, 0, 0, 0}; // of the batch
     bool plain_active() const { return skin_ready && plain_program != 0; }
-    void ffp_program() { // back to vitaGL's fixed-function pipeline (only for the init/present helpers without plain)
+    void ffp_program() { // back to vitaGL's fixed-function pipeline (only without the plain mode)
         if (bound_program == 0) return;
         glUseProgram(0);
-        for (GLuint i = 0; i < 5; ++i) glDisableVertexAttribArray(i);
+        for (GLuint i = 0; i < 7; ++i) glDisableVertexAttribArray(i);
         bound_program = 0; skin_bound = false;
     }
     void use_skin_program() {
         if (bound_program == 1) return;
-        glUseProgram(skin_program);
+        if (bound_program == 0) glUseProgram(skin_program);
+        static const GLfloat skin_mode[4] = {0, 0, 0, 0};
+        glUniform4fv(u_mode, 1, skin_mode);
         for (GLuint i = 0; i < 5; ++i) glEnableVertexAttribArray(i);
-        bound_program = 1; skin_bound = true; // uniform values stay with the program (GL semantics)
+        glDisableVertexAttribArray(5); glDisableVertexAttribArray(6);
+        bound_program = 1; skin_bound = true;
     }
     void use_plain_program() {
         if (bound_program == 2) return;
-        glUseProgram(plain_program);
-        for (GLuint i = 0; i < 3; ++i) glEnableVertexAttribArray(i);
+        if (bound_program == 0) glUseProgram(skin_program);
+        static const GLfloat plain_mode[4] = {1, 0, 0, 0};
+        glUniform4fv(u_mode, 1, plain_mode);
+        glEnableVertexAttribArray(2); glEnableVertexAttribArray(5); glEnableVertexAttribArray(6);
+        glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
         glDisableVertexAttribArray(3); glDisableVertexAttribArray(4);
+        skin_xform_gen = ~0ull; // uMvp is shared: the next skinned draw uploads its own again
         bound_program = 2; skin_bound = false;
     }
-    // One GVertex array through the plain program with the current GL state and the batch's fragment parameters.
+    // One GVertex array in plain mode with the current GL state and the batch's fragment parameters.
     void plain_draw(GLenum mode, const GVertex *v, GLsizei n, const GLfloat matrix[16], bool variant = true) {
         use_plain_program();
         static const GLfloat identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-        glUniform4fv(p_mat, 4, matrix ? matrix : identity);
+        glUniform4fv(u_mvp, 4, matrix ? matrix : identity);
         GLfloat tex[4] = {frag_tex[0], frag_tex[1], frag_tex[2], frag_tex[3]};
         if (variant && skin_debug) { // POCKET_GPU_SKIN_V13J
             if (skin_debug_last == 1) tex[3] = 1;
             if (skin_debug_last == 2) tex[0] = 0;
             if (skin_debug_last == 3 && tex[0] > 0.5f) { tex[1] = 3; tex[2] = 1; tex[3] = 1; }
         }
-        glUniform4fv(p_tex, 1, tex); glUniform4fv(p_env, 1, frag_env); glUniform4fv(p_alpha, 1, frag_alpha);
+        glUniform4fv(u_tex, 1, tex); glUniform4fv(u_env, 1, frag_env); glUniform4fv(u_alpha, 1, frag_alpha);
         constexpr GLsizei stride = sizeof(GVertex);
-        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, v[0].position);
-        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, v[0].color);
+        glVertexAttribPointer(6, 4, GL_FLOAT, GL_FALSE, stride, v[0].position);
+        glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, v[0].color);
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, v[0].uv);
         glDrawArrays(mode, 0, n);
     }
     bool plain_setup() {
         if (FILE *f = std::fopen("ux0:data/pocketprobe/no-plain-shader.flag", "rb")) {
             std::fclose(f); plain_enabled = false;
-            std::fprintf(stderr, "[gpu-plain] v13i off (no-plain-shader.flag): fixed-function batches as in v13h\n"); std::fflush(stderr);
+            std::fprintf(stderr, "[gpu-plain] off (no-plain-shader.flag): fixed-function batches as in v13h\n"); std::fflush(stderr);
             return true;
         }
-        const GLuint vs = skin_shader(GL_CG_VERTEX_SHADER_EXT, pocket::skin::kPlainVertexShader, "plain vertex");
-        const GLuint fs = skin_shader(GL_CG_FRAGMENT_SHADER_EXT, pocket::skin::kFragmentShader, "plain fragment");
-        if (!vs || !fs) return false;
-        const GLuint prog = glCreateProgram();
-        glAttachShader(prog, vs); glAttachShader(prog, fs);
-        glBindAttribLocation(prog, 0, "aPos"); glBindAttribLocation(prog, 1, "aColor"); glBindAttribLocation(prog, 2, "aUV");
-        glLinkProgram(prog);
-        GLint ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-        if (!ok) { std::fprintf(stderr, "[gpu-plain] link FAILED\n"); std::fflush(stderr); return false; }
-        auto loc = [&](const char *name) {
-            GLint l = glGetUniformLocation(prog, name);
-            if (l < 0) { char indexed[64]; std::snprintf(indexed, sizeof indexed, "%s[0]", name); l = glGetUniformLocation(prog, indexed); }
-            return l;
-        };
-        p_mat = loc("uMat"); p_tex = loc("uTex"); p_env = loc("uEnv"); p_alpha = loc("uAlpha"); p_sampler = loc("uTexture");
-        if (p_mat < 0 || p_tex < 0 || p_alpha < 0) { std::fprintf(stderr, "[gpu-plain] missing uniforms\n"); std::fflush(stderr); return false; }
-        glUseProgram(prog);
-        if (p_sampler >= 0) glUniform1i(p_sampler, 0);
-        glUseProgram(0); bound_program = 0;
+        if (u_mode < 0) { std::fprintf(stderr, "[gpu-plain] uMode not found\n"); std::fflush(stderr); return false; }
         // Untextured draws still sample unit 0: give it a real texture.
         const std::uint32_t white = 0xFFFFFFFFu;
         glGenTextures(1, &white_texture); glBindTexture(GL_TEXTURE_2D, white_texture);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &white);
-        plain_program = prog;
+        plain_program = skin_program;
         state_valid = false; prepared = false; // rebind the real texture state at the next draw
-        std::fprintf(stderr, "[gpu-plain] v13i ready: with the GPU skin on, every draw uses custom shaders (no fixed function)\n");
+        std::fprintf(stderr, "[gpu-plain] v13l ready: one custom program for every draw (no program switches)\n");
         std::fflush(stderr);
         return true;
     }
@@ -348,6 +339,7 @@ class VitaGpu final : public gpu::Backend {
         glBindAttribLocation(skin_program, 0, "aW0"); glBindAttribLocation(skin_program, 1, "aW1");
         glBindAttribLocation(skin_program, 2, "aUV"); glBindAttribLocation(skin_program, 3, "aN");
         glBindAttribLocation(skin_program, 4, "aP");
+        glBindAttribLocation(skin_program, 5, "aColor"); glBindAttribLocation(skin_program, 6, "aPos"); // V13L
         glLinkProgram(skin_program);
         GLint ok = 0; glGetProgramiv(skin_program, GL_LINK_STATUS, &ok);
         if (!ok) {
@@ -363,7 +355,7 @@ class VitaGpu final : public gpu::Backend {
         u_bones = loc("uBones"); u_world = loc("uWorld"); u_mvp = loc("uMvp"); u_uv = loc("uUv"); u_uvt = loc("uUvt");
         u_lpos = loc("uLpos"); u_ldir = loc("uLdir"); u_latt = loc("uLatt"); u_lspot = loc("uLspot");
         u_lamb = loc("uLamb"); u_ldif = loc("uLdif"); u_lspe = loc("uLspe");
-        u_mamb = loc("uMamb"); u_mdif = loc("uMdif"); u_mspe = loc("uMspe"); u_base = loc("uBase"); u_params = loc("uParams"); u_near = loc("uNear");
+        u_mamb = loc("uMamb"); u_mdif = loc("uMdif"); u_mspe = loc("uMspe"); u_base = loc("uBase"); u_params = loc("uParams"); u_near = loc("uNear"); u_mode = loc("uMode");
         u_tex = loc("uTex"); u_env = loc("uEnv"); u_alpha = loc("uAlpha"); u_sampler = loc("uTexture");
         if (u_bones < 0 || u_mvp < 0 || u_params < 0 || u_near < 0) { std::fprintf(stderr, "[gpu-skin] missing uniforms; disabled\n"); std::fflush(stderr); return false; }
         glUseProgram(skin_program);
@@ -371,7 +363,7 @@ class VitaGpu final : public gpu::Backend {
         glUseProgram(0); bound_program = 0;
         // POCKET_GPU_SKIN_V13I: without the plain program the skin path is not used at all (it breaks the other draws).
         if (!plain_setup()) { std::fprintf(stderr, "[gpu-plain] FAILED: GPU skin disabled, everything as without gpu-skin.flag\n"); std::fflush(stderr); return false; }
-        std::fprintf(stderr, "[gpu-skin] v13k program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
+        std::fprintf(stderr, "[gpu-skin] v13l program ready (Cg vertex + fragment compiled and linked)\n"); std::fflush(stderr);
         skin_ready = true;
         return true;
     }
@@ -554,7 +546,7 @@ private:
         }
     }
     void plain_state() {
-        ffp_program();
+        if (!(plain_active() && plain_enabled)) ffp_program(); // POCKET_GPU_SKIN_V13L
         glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
         glDisable(GL_ALPHA_TEST); glDisable(GL_CULL_FACE); glDisable(GL_LIGHTING);
         glDisable(GL_FOG); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);

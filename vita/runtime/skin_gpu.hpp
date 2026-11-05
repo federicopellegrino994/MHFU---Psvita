@@ -295,7 +295,8 @@ inline Out run_vertex(const Uniforms &u, const Vertex &v) {
 inline constexpr const char *kVertexShader = R"(
 float spow(float x, float y) { return x > 0.0 ? pow(x, y) : (y == 0.0 ? 1.0 : 0.0); }
 void main(
-    float4 aW0, float4 aW1, float2 aUV, float3 aN, float3 aP,
+    float4 aW0, float4 aW1, float2 aUV, float3 aN, float3 aP, float4 aColor, float4 aPos,
+    uniform float4 uMode,
     uniform float4 uBones[24], uniform float4 uWorld[3], uniform float4 uMvp[4],
     uniform float4 uUv, uniform float4 uUvt,
     uniform float4 uLpos[4], uniform float4 uLdir[4], uniform float4 uLatt[4], uniform float4 uLspot[4],
@@ -304,6 +305,13 @@ void main(
     uniform float4 uNear,
     float4 out vPosition : POSITION, float4 out vColor : COLOR, float2 out vTexcoord : TEXCOORD0)
 {
+  // POCKET_GPU_SKIN_V13L: one program for everything. uMode.x = 1: an already transformed GVertex batch
+  // (aPos clip or model space times uMvp, aColor, aUV as is); 0: a skinned and lit PSP model.
+  if (uMode.x > 0.5) {
+    vPosition = uMvp[0] * aPos.x + uMvp[1] * aPos.y + uMvp[2] * aPos.z + uMvp[3] * aPos.w;
+    vColor = aColor;
+    vTexcoord = aUV;
+  } else {
     float4 w0 = aW0 * (1.0 / 128.0);
     float4 w1 = aW1 * (1.0 / 128.0);
     float4 R0 = uBones[0] * w0.x + uBones[3] * w0.y + uBones[6] * w0.z + uBones[9] * w0.w
@@ -361,6 +369,7 @@ void main(
     }
     float3 one = float3(1.0, 1.0, 1.0);
     vColor = float4(saturate(min(c.xyz, one) + min(s, one)), saturate(min(c.w, 1.0)));
+  }
 }
 )";
 
